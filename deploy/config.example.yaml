@@ -1,0 +1,41 @@
+# TightShip deployment file — layer 1: environment-specific, NON-secret settings.
+# Copy to /etc/tightship/config.yaml and edit. Unknown keys are errors.
+# Credentials never go here: upload them in Admin -> Credentials once the service is running.
+
+org:
+  name: Example County Schools      # shown on end-user-facing pages
+  short: Example Schools
+  timezone: America/New_York        # for display; storage is UTC
+
+server:
+  listen: 127.0.0.1:8090            # behind your reverse proxy, which terminates TLS
+  public_url: https://app.example.org
+  trusted_proxies: [10.0.0.10, 10.0.0.11]
+
+database:
+  host: 127.0.0.1
+  port: 3306
+  name: tightship
+  user: tightship
+  password_env: TIGHTSHIP_DB_PASSWORD   # bootstrap only; read once at start
+
+domains:
+  staff: example.org
+  students: students.example.org
+
+mail:
+  relay: mail.example.org:25
+  from: tightship@example.org
+
+secrets:
+  master_key_file: /etc/tightship/master.key   # 32 random bytes; encrypts the credential store
+
+# Modules this deployment runs. A module whose integration is not configured does not register.
+modules:
+  - core
+  - helpdesk
+  - chromebooks
+  - identity
+
+dev:
+  allow_debug_identity: false       # NEVER true in production

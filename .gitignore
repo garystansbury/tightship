@@ -1,0 +1,8 @@
+/bin/
+/internal/webui/dist/*
+!/internal/webui/dist/.gitkeep
+/web/node_modules/
+/web/dist/
+/deploy/config.dev.yaml
+*.key
+.DS_Store

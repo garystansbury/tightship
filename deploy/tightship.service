@@ -1,0 +1,23 @@
+# systemd unit for a TightShip deployment. Ships with each release; a deployment repo pins the
+# release tag and installs this alongside its config.yaml.
+[Unit]
+Description=TightShip
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tightship
+Group=tightship
+ExecStart=/usr/local/bin/tightship serve --config /etc/tightship/config.yaml
+EnvironmentFile=-/etc/tightship/env
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/tightship
+StateDirectory=tightship
+
+[Install]
+WantedBy=multi-user.target

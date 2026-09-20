@@ -1,0 +1,12 @@
+:root { color-scheme: light dark; font: 15px/1.5 system-ui, sans-serif; }
+body { margin: 0; }
+.shell { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+aside { padding: 16px; border-right: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+aside h1 { font-size: 18px; margin: 0 0 16px; }
+aside h2 { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; opacity: .6; margin: 16px 0 4px; }
+aside a { display: block; padding: 6px 8px; border-radius: 4px; color: inherit; text-decoration: none; }
+aside a:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
+main { padding: 24px; }
+.banner { background: #f6ead0; color: #5a3d00; padding: 8px 10px; border-radius: 4px; font-size: 13px; }
+.muted { opacity: .65; }
+.error { color: #b3473a; }

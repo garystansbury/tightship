@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: web/package-lock.json }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: web
+        run: cd web && npm ci && npm run build
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./...
+      - name: build
+        run: CGO_ENABLED=0 go build -trimpath -ldflags '-s -w -X main.version=${{ github.sha }}' -o bin/tightship ./cmd/tightship
+      - name: smoke
+        run: ./bin/tightship check --config deploy/config.example.yaml && ./bin/tightship routes --config deploy/config.example.yaml
