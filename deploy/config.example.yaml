@@ -18,6 +18,13 @@ database:
   name: tightship
   user: tightship
   password_env: TIGHTSHIP_DB_PASSWORD   # bootstrap only; read once at start
+  # Pool. Sized here because the right numbers depend on the server: max_connections is shared
+  # with every other client, and several instances restarting at once must not exhaust it.
+  max_open_conns: 25
+  max_idle_conns: 25
+  conn_max_lifetime: 30m                # well under MariaDB's wait_timeout, so the pool retires
+  conn_max_idle_time: 5m                #   a connection before the server closes it underneath us
+  connect_timeout: 10s
 
 domains:
   staff: example.org

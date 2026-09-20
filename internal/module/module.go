@@ -4,7 +4,7 @@
 package module
 
 import (
-	"embed"
+	"io/fs"
 
 	"github.com/garystansbury/tightship/internal/authz"
 	"github.com/garystansbury/tightship/internal/httpapi"
@@ -19,9 +19,12 @@ type Module interface {
 	Capabilities() []authz.Capability
 	// Routes registers the module's endpoints, each with the capability it demands.
 	Routes(r *httpapi.Router)
-	// Migrations is the module's embedded SQL, applied in order by the core migrator. A module
-	// owns its tables; no other module writes them.
-	Migrations() embed.FS
+	// Migrations is the module's embedded SQL under a migrations/ directory, applied in order by
+	// the core migrator. A module owns its tables; no other module writes them.
+	//
+	// It is fs.FS rather than embed.FS so a module can be tested against an in-memory set —
+	// embed.FS satisfies it, so a real module still just returns its //go:embed field.
+	Migrations() fs.FS
 	// Nav declares the entries this module contributes, each gated by a capability. The UI shows
 	// an entry only when GET /api/v1/me lists the capability.
 	Nav() []NavEntry

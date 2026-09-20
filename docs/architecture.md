@@ -60,16 +60,67 @@ request ──► route table ──► authz.Can(identity, bindings, capability
 ## Layout
 
 ```
-cmd/tightship/        the binary: serve, check, routes, version
+cmd/tightship/        the binary: serve, check, routes, migrate, version
 internal/authz/       capabilities, grants, scope, Can, Capabilities
 internal/httpapi/     the route table, the middleware, /api/v1/me
 internal/config/      layer 1
+internal/database/    the pool and the migration runner
 internal/module/      the Module contract
 internal/webui/       the embedded web app (dist/ is the Vite build output)
 web/                  the TypeScript app (Vite + React)
 deploy/               example config and systemd unit, shipped with each release
 docs/                 this
 ```
+
+## The database layer
+
+One pool, opened at start and proven before the listener comes up. A binary that starts without a
+working database and discovers it on the first request has turned a deployment failure into a
+user-facing one.
+
+Four things are decided once here so no module repeats them:
+
+- **UTC on the wire.** The session time zone is pinned to `+00:00` and the driver parses DATETIME
+  into `time.Time` as UTC. Rule 9 is "store UTC, display local", and the half that breaks quietly
+  is the server's own `NOW()` on a host set to local time.
+- **Strict SQL mode.** `STRICT_ALL_TABLES` plus the zero-date and division rules. A silently
+  truncated value is precisely the defect that ships green.
+- **The application pool cannot run two statements in one call.** Migrations need that and get
+  their own single connection with it enabled; the request path does not, so a query-building
+  mistake cannot become a second statement.
+- **The pool is sized in the deployment file.** `max_connections` is shared with every other
+  client on that server, and several instances restarting at once must not exhaust it.
+
+### Migrations
+
+A module owns a `migrations/` directory in its embedded FS, holding `NNNN_description.sql`.
+Modules apply alphabetically, versions ascend within a module. Order between modules is
+alphabetical rather than wiring order because wiring order is easy to change by accident; rule 7
+is what makes that sufficient, since a module needing another's tables first would already be
+breaking it.
+
+`schema_migrations` records module, version, name, checksum, `started_at` and `applied_at`. Three
+properties come out of that shape:
+
+- **MariaDB cannot roll back DDL.** A migration that fails halfway leaves a schema no retry can
+  fix. The row is written *before* the SQL runs and completed after, so a row with a null
+  `applied_at` means a previous run died partway — the next start refuses rather than stacking
+  later migrations on a schema nobody can describe.
+- **A released migration is immutable.** The checksum is compared on every start; editing one
+  would mean two deployments reporting the same version with different schemas.
+- **One instance migrates at a time.** `GET_LOCK` is held for the run, so a rolling restart does
+  not have two binaries applying the same migration. It is session-scoped, so a crashed migrator
+  releases it instead of blocking the next start forever.
+
+### Migrations stay rollback-safe for one release
+
+A deployment rolls back by pinning the previous tag, so the previous release's code has to keep
+working against this release's schema. That is a policy nobody can hold in their head across a
+year of migrations, so `tightship check` enforces it: dropping a table or column, any rename, and
+adding a `NOT NULL` column with no default are all refused.
+
+Removing a column is still possible, it just takes two releases — stop writing it in release N,
+drop it in N+1, by which point no deployment can roll back to code that reads it.
 
 ## Interface principles
 

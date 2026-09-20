@@ -1,9 +1,10 @@
 // Command tightship is the single binary: the API, the embedded web app, migrations and the job
 // scheduler, in one process.
 //
-//	tightship serve  --config /etc/tightship/config.yaml
-//	tightship check  --config /etc/tightship/config.yaml
-//	tightship routes --config /etc/tightship/config.yaml
+//	tightship serve   --config /etc/tightship/config.yaml
+//	tightship check   --config /etc/tightship/config.yaml
+//	tightship routes  --config /etc/tightship/config.yaml
+//	tightship migrate --config /etc/tightship/config.yaml
 //	tightship version
 package main
 
@@ -21,7 +22,9 @@ import (
 
 	"github.com/garystansbury/tightship/internal/authz"
 	"github.com/garystansbury/tightship/internal/config"
+	"github.com/garystansbury/tightship/internal/database"
 	"github.com/garystansbury/tightship/internal/httpapi"
+	"github.com/garystansbury/tightship/internal/module"
 	"github.com/garystansbury/tightship/internal/webui"
 )
 
@@ -44,6 +47,8 @@ func main() {
 		err = runRoutes(os.Args[2:])
 	case "serve":
 		err = runServe(os.Args[2:], log)
+	case "migrate":
+		err = runMigrate(os.Args[2:], log)
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -57,7 +62,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: tightship <serve|check|routes|version> [--config FILE]")
+	fmt.Fprintln(os.Stderr, "usage: tightship <serve|check|routes|migrate|version> [--config FILE]")
 }
 
 func loadConfig(args []string) (*config.Config, error) {
@@ -69,13 +74,82 @@ func loadConfig(args []string) (*config.Config, error) {
 	return config.Load(*path)
 }
 
+// modules returns the modules this build contains, filtered to those the deployment enabled.
+// Each is both an HTTP surface and a migration source; nothing else in the binary knows the list.
+func modules(c *config.Config) []module.Module {
+	var all []module.Module // populated as modules land; see docs/roadmap.md
+	var on []module.Module
+	for _, m := range all {
+		if c.ModuleEnabled(m.Name()) {
+			on = append(on, m)
+		}
+	}
+	return on
+}
+
+func migrationSources(c *config.Config) []database.Source {
+	var out []database.Source
+	for _, m := range modules(c) {
+		out = append(out, m)
+	}
+	return out
+}
+
+// dbPassword reads the bootstrap password from the environment variable the deployment file
+// names. It is deliberately not in the config file: layer 1 is non-secret, and a password in it
+// would be read by every operator who debugs a YAML problem.
+func dbPassword(c *config.Config) (string, error) {
+	pw, ok := os.LookupEnv(c.Database.PasswordEnv)
+	if !ok {
+		return "", fmt.Errorf("%s is not set: the deployment file names it as database.password_env",
+			c.Database.PasswordEnv)
+	}
+	return pw, nil
+}
+
 func runCheck(args []string) error {
 	c, err := loadConfig(args)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ok: %s, %d module(s) enabled, listening on %s, frontend %s\n",
-		c.Org.Name, len(c.Modules), c.Server.Listen, map[bool]string{true: "embedded", false: "NOT built"}[webui.Built()])
+	// Check the migrations too. `check` is what CI and an operator run before a deployment, and
+	// a migration that breaks rollback is exactly the thing worth catching there rather than at
+	// 3am when the rollback is attempted.
+	migrations, err := database.Collect(migrationSources(c))
+	if err != nil {
+		return err
+	}
+	if findings := database.Lint(migrations); len(findings) > 0 {
+		for _, f := range findings {
+			fmt.Fprintln(os.Stderr, "  "+f.String())
+		}
+		return fmt.Errorf("%d migration(s) would break a rollback to the previous release", len(findings))
+	}
+
+	fmt.Printf("ok: %s, %d module(s) enabled, %d migration(s), listening on %s, frontend %s\n",
+		c.Org.Name, len(c.Modules), len(migrations), c.Server.Listen,
+		map[bool]string{true: "embedded", false: "NOT built"}[webui.Built()])
+	return nil
+}
+
+// runMigrate applies pending migrations and stops. A deployment that would rather migrate as a
+// separate step than at start-up runs this first; serve then finds nothing to do.
+func runMigrate(args []string, log *slog.Logger) error {
+	c, err := loadConfig(args)
+	if err != nil {
+		return err
+	}
+	password, err := dbPassword(c)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	n, err := database.Migrate(ctx, c.Database, password, migrationSources(c), log)
+	if err != nil {
+		return err
+	}
+	log.Info("migrations complete", "applied", n)
 	return nil
 }
 
@@ -113,7 +187,34 @@ func runServe(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	password, err := dbPassword(c)
+	if err != nil {
+		return err
+	}
+
+	// Migrate before listening. A binary that serves requests against a schema it has not
+	// finished migrating answers some of them wrongly, which is worse than being briefly down.
+	migrateCtx, cancelMigrate := context.WithTimeout(context.Background(), 30*time.Minute)
+	applied, err := database.Migrate(migrateCtx, c.Database, password, migrationSources(c), log)
+	cancelMigrate()
+	if err != nil {
+		return err
+	}
+	if applied > 0 {
+		log.Info("migrations applied at start", "count", applied)
+	}
+
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), c.Database.ConnectTimeout)
+	db, err := database.Open(openCtx, c.Database, password)
+	cancelOpen()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
 	api := buildRouter(c, log)
+	api.CheckHealth("database", func(ctx context.Context) error { return database.Health(ctx, db) })
+
 	mux := http.NewServeMux()
 	mux.Handle("/api/", api)
 	mux.Handle("/healthz", api)

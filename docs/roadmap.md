@@ -14,31 +14,33 @@ Done:
 - [x] Module contract
 - [x] Embedded web app; Vite + React + TypeScript shell rendering navigation from `/me`
 - [x] CI; tag → release with static binary, checksum, example config, systemd unit
+- [x] Database layer: pool sized from config, per-module embedded migrations applied at start,
+      `schema_migrations` with checksums and partial-failure detection, advisory lock, and a
+      rollback-safety lint that `tightship check` runs
 
 Next, in order:
-1. **Database layer.** MariaDB driver, a connection pool sized from config, embedded migrations
-   run at start (per module, in order), a `schema_migrations` table. Migrations must stay
-   backward-compatible for one release so a deployment can roll back by pinning the previous tag.
-2. **Sessions.** Server-side, stored in the database, one cookie for every kind of user. Sliding
+1. **Sessions.** Server-side, stored in the database, one cookie for every kind of user. Sliding
    idle window plus absolute lifetime, both from config. Revocation by row.
-3. **Sign-in.** Google OpenID Connect for the staff domain (the first identity kind); a sign-in
+2. **Sign-in.** Google OpenID Connect for the staff domain (the first identity kind); a sign-in
    route that stores the return URL the app saved and sends the browser back to it. The identity
    resolver replaces the debug header outside development.
-4. **Identity module.** `users`, `roles`, `role_grants` (with scope), `role_bindings`
+3. **Identity module.** `users`, `roles`, `role_grants` (with scope), `role_bindings`
    (role → capability), `audit_log` with real and effective actor. `/me` starts returning real
    capabilities. Impersonation: start, stop, status; lower-privilege targets only; read-only.
-5. **Credential store** (layer 2). AES-GCM with the master key from `secrets.master_key_*`;
+4. **Credential store** (layer 2). AES-GCM with the master key from `secrets.master_key_*`;
    upload, test-connection, expiry, owner module, audit; the admin screen for it.
-6. **First real module: Schools and Rooms.** Small enough to prove the path — migrations, routes,
+5. **First real module: Schools and Rooms.** Small enough to prove the path — migrations, routes,
    capabilities, navigation, a list page, a detail page, a form — and needed by everything after.
-7. **Roles screen.** Grant roles to people with scope; bind capabilities to roles from the
+6. **Roles screen.** Grant roles to people with scope; bind capabilities to roles from the
    catalogue. Gate behind `roles.bind`. Only after the catalogue has settled.
-8. **Job scheduler.** In-process, DB leader lease, run log, health beat per job, catch-up policy
+7. **Job scheduler.** In-process, DB leader lease, run log, health beat per job, catch-up policy
    per job. Retention jobs are the first customers.
-9. **Demo mode.** Integrations behind interfaces with fixture implementations, a seed, and a
+8. **Demo mode.** Integrations behind interfaces with fixture implementations, a seed, and a
    way to view the app as each seeded role. This is also the screenshot-test harness.
-10. **Observability.** Structured logs with request IDs; a health endpoint that proves the
-    database and the credential store, not just the process.
+9. **Observability.** Structured logs with request IDs; a health endpoint that proves the
+   credential store as well as the database. (`/healthz` already proves the database: it reads
+   `schema_migrations`, because `SELECT 1` stays green against a server the application cannot
+   read a row from.)
 
 ## Phase 2 — Help Desk
 
