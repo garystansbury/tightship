@@ -33,6 +33,9 @@ func (m Module) Routes(r *httpapi.Router) {
 
 	// --- your own password --------------------------------------------------
 	r.Handle(http.MethodPost, "/api/v1/auth/password", CapPasswordSetOwn, nil, s.handleChangeOwnPassword)
+
+	// --- roles, bindings and grants ------------------------------------------
+	m.roleRoutes(r)
 }
 
 // Dependencies the handlers need but the module contract does not carry. Set by cmd/tightship

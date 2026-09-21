@@ -25,9 +25,9 @@ type Capability string
 // particular one" for a request. A school-scoped grant never satisfies a request that names no
 // school: district-wide actions need district-wide grants.
 type Scope struct {
-	School string
-	Room   string
-	Queue  string
+	School string `json:"school"`
+	Room   string `json:"room"`
+	Queue  string `json:"queue"`
 }
 
 // Grant is one role held by an identity, possibly bounded to a school, room or queue.

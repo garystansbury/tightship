@@ -216,6 +216,43 @@ start retires the previous one, so a restarted deployment does not leave a trail
 A rejected attempt does not consume the token: one mistyped password should not burn the only way
 in.
 
+## Roles, bindings and grants
+
+Capabilities are code; bindings are data. A district composes its own roles out of the catalogue
+without a code change, and nothing in the database can invent a capability, because a capability
+means something only because a route enforces it. A binding naming a capability this build does
+not have is inert rather than an error — a module turned off, or a capability retired in a later
+release, must not stop the rest of a role working.
+
+**The escalation guard.** Anyone who can edit roles is otherwise one request away from every
+capability in the catalogue: bind `auth.settings.write` to a role you already hold, and you are an
+administrator. The rule is that **you cannot give away a capability you do not hold yourself** —
+which makes role editing a way to delegate authority downwards and never a way to acquire it. It
+applies to binding capabilities to a role and to granting a role to a person, because otherwise
+granting is just a slower way to launder the capabilities binding refused you.
+
+It is enforced in the service rather than a handler, so a future CLI or installer is bound by it
+too, and the refusal names every offending capability at once — fixing a role one refusal at a
+time is how somebody gives up and asks for the administrator role instead. The catalogue endpoint
+reports `held_by_you` per capability, so the interface can grey out what this person cannot
+delegate rather than letting them discover it by being refused.
+
+**One built-in role.** `administrator` is reconciled against the catalogue at every start: it
+gains capabilities a release adds and loses ones it retires, so it always means "everything this
+build enforces". Without that, a capability shipped on Tuesday is held by nobody on Tuesday
+morning and the screen needing it appears broken. It cannot be edited or deleted through the
+interface, and the last grant of it cannot be revoked — that is the same failure as switching off
+every sign-in method, reached from the other side, and it also needs a database console to undo.
+
+**Scope is on the grant, not the role.** The same role means different things bounded to
+different schools. The columns are `school_code` and `room_guid` because that is what the data
+already uses — `school_code` appears in nineteen tables of the production schema and `room_guid`
+in eleven. Empty means "anywhere" and is stored as the empty string rather than NULL, because in
+MySQL two NULLs are not duplicates and the unique key would stop constraining.
+
+**A disabled account holds nothing**, whatever it was granted, and disabled administrators do not
+count towards the last-administrator check.
+
 ## Interface principles
 
 - Every screen state is a URL: tabs, filters, selected records, impersonation.

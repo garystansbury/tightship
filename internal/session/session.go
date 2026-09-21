@@ -70,6 +70,10 @@ type Session struct {
 	ExpiresAt  time.Time
 }
 
+// Effective is who this session acts as. It is Subject until impersonation exists, and the
+// indirection is here now so the call sites that matter are already asking the right question.
+func (s Session) Effective() string { return s.Subject }
+
 // Store issues and validates sessions.
 type Store struct {
 	db   *sql.DB
