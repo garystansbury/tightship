@@ -15,6 +15,7 @@ decisions behind it. It is written for someone about to add a module.
 | D5 | **Object pages, not tool pages.** | Devices, people, tickets, rooms and schools are the destinations. "Where do I go to do X" stops being a question when you go to the thing. |
 | D6 | **Districts are configuration and modules.** | Four layers, below. Nothing in the core knows a vendor or a district name. |
 | D7 | **A deployment pins a tag.** | Fixes go upstream first and arrive as the next release. No forks. |
+| D8 | **A module talks to a store, not to tables.** | A deployment replacing an existing suite keeps both interfaces live indefinitely, over one source of truth. A module's store has a native implementation and, where a domain has not cut over, one that adapts the incumbent's tables — so nothing diverges and the product inherits no one deployment's schema. One writer per domain, always; the adapters live downstream, not here. See [coexistence](coexistence.md). |
 
 ## The request path
 
@@ -70,6 +71,9 @@ web/                  the TypeScript app (Vite + React)
 deploy/               example config and systemd unit, shipped with each release
 docs/                 this
 ```
+
+Two pages carry decisions too long for this one: [coexistence](coexistence.md), on running beside
+the suite TightShip replaces, and [rbac](rbac.md).
 
 ## Interface principles
 

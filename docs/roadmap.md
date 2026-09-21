@@ -66,6 +66,27 @@ DHCP reservations, per-user Wi-Fi keys, managed file transfer, roster sync, job 
 and observability, reporting and published queries. Then the original suite is a set of links,
 and is retired.
 
+## Coexistence with the suite being replaced
+
+Recorded in [coexistence](coexistence.md), and load-bearing for every module after the first.
+
+Both interfaces stay functional indefinitely; people move across because TightShip is the better
+place to work, not because a date arrived. A module talks to a store interface with a native and a
+legacy implementation, exactly one system writes a given domain at a time, and when a domain flips,
+the legacy suite becomes a **client** of TightShip for it — reading its tables directly with a
+SELECT-only account where one connection can reach both, writing through its API.
+
+Unbuilt, and forced by the first module that needs live data from an incumbent system: the
+per-module backend in config; the rule that a module's configured backend, never the presence of
+its tables, decides authority; the read-only legacy pool and an authenticated health endpoint that
+names dependencies the public one must not; `Identity.Via` and a service account that may assert an
+actor; and an API versioning policy, since another system depending on the API makes it a
+compatibility surface rather than an internal detail.
+
+The adapters themselves are not built here. A deployment with a legacy suite to migrate composes
+its own binary in a private repository that imports this one as a library — composition, not a
+fork, so D7 holds.
+
 ## Open decisions
 
 - React or Preact (same code either way; React unless bundle size on old devices bites).
