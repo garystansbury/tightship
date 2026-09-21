@@ -17,27 +17,28 @@ Done:
 - [x] Database layer: pool sized from config, per-module embedded migrations applied at start,
       `schema_migrations` with checksums and partial-failure detection, advisory lock, and a
       rollback-safety lint that `tightship check` runs
+- [x] Sessions: server-side, one cookie for every kind of user, token stored only as a hash,
+      sliding idle window under an absolute lifetime (both from config, both enforced in SQL),
+      revocation by row, and a session-backed identity resolver
 
 Next, in order:
-1. **Sessions.** Server-side, stored in the database, one cookie for every kind of user. Sliding
-   idle window plus absolute lifetime, both from config. Revocation by row.
-2. **Sign-in.** Google OpenID Connect for the staff domain (the first identity kind); a sign-in
+1. **Sign-in.** Google OpenID Connect for the staff domain (the first identity kind); a sign-in
    route that stores the return URL the app saved and sends the browser back to it. The identity
    resolver replaces the debug header outside development.
-3. **Identity module.** `users`, `roles`, `role_grants` (with scope), `role_bindings`
+2. **Identity module.** `users`, `roles`, `role_grants` (with scope), `role_bindings`
    (role → capability), `audit_log` with real and effective actor. `/me` starts returning real
    capabilities. Impersonation: start, stop, status; lower-privilege targets only; read-only.
-4. **Credential store** (layer 2). AES-GCM with the master key from `secrets.master_key_*`;
+3. **Credential store** (layer 2). AES-GCM with the master key from `secrets.master_key_*`;
    upload, test-connection, expiry, owner module, audit; the admin screen for it.
-5. **First real module: Schools and Rooms.** Small enough to prove the path — migrations, routes,
+4. **First real module: Schools and Rooms.** Small enough to prove the path — migrations, routes,
    capabilities, navigation, a list page, a detail page, a form — and needed by everything after.
-6. **Roles screen.** Grant roles to people with scope; bind capabilities to roles from the
+5. **Roles screen.** Grant roles to people with scope; bind capabilities to roles from the
    catalogue. Gate behind `roles.bind`. Only after the catalogue has settled.
-7. **Job scheduler.** In-process, DB leader lease, run log, health beat per job, catch-up policy
+6. **Job scheduler.** In-process, DB leader lease, run log, health beat per job, catch-up policy
    per job. Retention jobs are the first customers.
-8. **Demo mode.** Integrations behind interfaces with fixture implementations, a seed, and a
+7. **Demo mode.** Integrations behind interfaces with fixture implementations, a seed, and a
    way to view the app as each seeded role. This is also the screenshot-test harness.
-9. **Observability.** Structured logs with request IDs; a health endpoint that proves the
+8. **Observability.** Structured logs with request IDs; a health endpoint that proves the
    credential store as well as the database. (`/healthz` already proves the database: it reads
    `schema_migrations`, because `SELECT 1` stays green against a server the application cannot
    read a row from.)

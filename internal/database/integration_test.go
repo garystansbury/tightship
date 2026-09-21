@@ -28,8 +28,11 @@ func testConfig(t *testing.T) (config.Database, string) {
 	if raw == "" {
 		t.Skip("set TIGHTSHIP_TEST_DSN to run database integration tests")
 	}
-	c := config.Database{Host: "127.0.0.1", Port: 3306, ConnectTimeout: 10 * time.Second,
-		MaxOpenConns: 4, ConnMaxLifetime: time.Minute, ConnMaxIdleTime: time.Minute}
+	c := config.Database{Host: "127.0.0.1", Port: 3306,
+		ConnectTimeout:  config.Duration(10 * time.Second),
+		MaxOpenConns:    4,
+		ConnMaxLifetime: config.Duration(time.Minute),
+		ConnMaxIdleTime: config.Duration(time.Minute)}
 	var password string
 	for _, kv := range strings.Fields(raw) {
 		k, v, _ := strings.Cut(kv, "=")
@@ -58,6 +61,14 @@ func testConfig(t *testing.T) (config.Database, string) {
 		// Without a schema the connection has no default database and dropAll silently drops
 		// nothing, so the tests run against whatever the previous run left behind.
 		t.Fatal("TIGHTSHIP_TEST_DSN needs at least user= and name=")
+	}
+	// `go test ./...` runs packages in parallel, and this package's tests drop every table in
+	// their schema. Sharing one database with another package's integration tests means whichever
+	// starts second finds its tables gone — so the DSN names a base and each package works in its
+	// own database beside it.
+	c.Name = c.Name + "_database"
+	if _, err := ensureSchema(c, password); err != nil {
+		t.Skipf("cannot prepare %s: %v", c.Name, err)
 	}
 	return c, password
 }
