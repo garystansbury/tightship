@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/garystansbury/tightship/internal/config"
 	"github.com/garystansbury/tightship/internal/database"
 	"github.com/garystansbury/tightship/internal/httpapi"
+	"github.com/garystansbury/tightship/internal/identity"
 	"github.com/garystansbury/tightship/internal/module"
 	"github.com/garystansbury/tightship/internal/session"
 	"github.com/garystansbury/tightship/internal/webui"
@@ -77,8 +79,11 @@ func loadConfig(args []string) (*config.Config, error) {
 
 // modules returns the modules this build contains, filtered to those the deployment enabled.
 // Each is both an HTTP surface and a migration source; nothing else in the binary knows the list.
-func modules(c *config.Config) []module.Module {
-	var all []module.Module // populated as modules land; see docs/roadmap.md
+//
+// ident may be nil when only the migration set is wanted — `check` and `routes` do not open a
+// database, and a module's tables and capabilities are knowable without one.
+func modules(c *config.Config, ident *identity.Service) []module.Module {
+	all := []module.Module{identity.Module{Service: ident}}
 	var on []module.Module
 	for _, m := range all {
 		if c.ModuleEnabled(m.Name()) {
@@ -93,7 +98,7 @@ func modules(c *config.Config) []module.Module {
 // enough to say exactly that without pretending otherwise.
 func migrationSources(c *config.Config) []database.Source {
 	out := []database.Source{session.Source{}}
-	for _, m := range modules(c) {
+	for _, m := range modules(c, nil) {
 		out = append(out, m)
 	}
 	return out
@@ -109,6 +114,32 @@ func dbPassword(c *config.Config) (string, error) {
 			c.Database.PasswordEnv)
 	}
 	return pw, nil
+}
+
+// setupTokenValidFor bounds how long a printed setup link works. The control that actually
+// matters is that setup refuses once an account exists; this bounds the window before that, for
+// the case where a deployment is started and then left.
+const setupTokenValidFor = time.Hour
+
+func announceSetup(ctx context.Context, ident *identity.Service, c *config.Config, log *slog.Logger) error {
+	need, err := ident.SetupRequired(ctx)
+	if err != nil {
+		return err
+	}
+	if !need {
+		return nil
+	}
+	token, err := ident.IssueSetupToken(ctx, setupTokenValidFor)
+	if err != nil {
+		return err
+	}
+	url := strings.TrimSuffix(c.Server.PublicURL, "/") + "/setup?token=" + token
+	// Deliberately not a structured field: this is the one line an operator has to read and copy
+	// out of a terminal, and a key=value log line makes that harder, not easier.
+	log.Warn("no accounts exist yet — open this once to create the first administrator; " +
+		"it expires in " + setupTokenValidFor.String() + " and is replaced on restart")
+	fmt.Fprintf(os.Stderr, "\n    %s\n\n", url)
+	return nil
 }
 
 func cookies(c *config.Config) session.Cookies {
@@ -161,22 +192,26 @@ func runMigrate(args []string, log *slog.Logger) error {
 	return nil
 }
 
-func buildRouter(c *config.Config, sessions *session.Store, log *slog.Logger) *httpapi.Router {
-	var identity httpapi.IdentityResolver
+func buildRouter(c *config.Config, sessions *session.Store, ident *identity.Service, log *slog.Logger) *httpapi.Router {
+	var resolver httpapi.IdentityResolver
 	if sessions != nil {
-		identity = session.IdentityResolver(sessions, cookies(c), log)
+		resolver = session.IdentityResolver(sessions, cookies(c), log)
 	}
 	if c.Dev.AllowDebugIdentity {
 		// The debug header wins where it is enabled, so a developer can act as anyone without
 		// signing in. main refuses to enable it unless the deployment file asks for it, and the
 		// deployment file says never in production.
 		log.Warn("dev.allow_debug_identity is ON: requests may name their own identity in a header")
-		identity = httpapi.DebugHeaderIdentity
+		resolver = httpapi.DebugHeaderIdentity
 	}
 	// Bindings come from the database once the identity module lands; until then nobody holds
 	// anything, which is the correct failure direction.
 	bindings := func(*http.Request) authz.Bindings { return authz.Bindings{} }
-	return httpapi.New(identity, bindings, log)
+	r := httpapi.New(resolver, bindings, log)
+	for _, m := range modules(c, ident) {
+		m.Routes(r)
+	}
+	return r
 }
 
 func runRoutes(args []string) error {
@@ -184,7 +219,7 @@ func runRoutes(args []string) error {
 	if err != nil {
 		return err
 	}
-	for _, rt := range buildRouter(c, nil, slog.Default()).Routes() {
+	for _, rt := range buildRouter(c, nil, nil, slog.Default()).Routes() {
 		need := string(rt.Capability)
 		if rt.Public {
 			need = "(public)"
@@ -227,8 +262,18 @@ func runServe(args []string, log *slog.Logger) error {
 	defer db.Close()
 
 	sessions := session.New(db, c.Sessions.IdleTimeout.Std(), c.Sessions.AbsoluteLifetime.Std())
+	ident := identity.NewService(db, log)
+	ident.Wire(identity.Deps{Sessions: sessions, Cookies: cookies(c)})
 
-	api := buildRouter(c, sessions, log)
+	// A deployment with no accounts cannot be signed into, so the first start prints a one-time
+	// setup link. It is reissued on every start until setup is done, which retires any earlier
+	// one — so a token sitting in a log aggregator stops working as soon as the service restarts,
+	// and stops working permanently the moment the first account exists.
+	if err := announceSetup(context.Background(), ident, c, log); err != nil {
+		return err
+	}
+
+	api := buildRouter(c, sessions, ident, log)
 	api.CheckHealth("database", func(ctx context.Context) error { return database.Health(ctx, db) })
 
 	mux := http.NewServeMux()
