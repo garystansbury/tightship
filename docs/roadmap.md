@@ -20,25 +20,34 @@ Done:
 - [x] Sessions: server-side, one cookie for every kind of user, token stored only as a hash,
       sliding idle window under an absolute lifetime (both from config, both enforced in SQL),
       revocation by row, and a session-backed identity resolver
+- [x] Local sign-in: accounts, Argon2id passwords, database-backed lockout, the auth-settings knob
+      with the "local cannot be disabled until SSO has actually worked" guard, and one-time
+      first-run setup
 
 Next, in order:
-1. **Sign-in.** Google OpenID Connect for the staff domain (the first identity kind); a sign-in
-   route that stores the return URL the app saved and sends the browser back to it. The identity
-   resolver replaces the debug header outside development.
-2. **Identity module.** `users`, `roles`, `role_grants` (with scope), `role_bindings`
-   (role → capability), `audit_log` with real and effective actor. `/me` starts returning real
-   capabilities. Impersonation: start, stop, status; lower-privilege targets only; read-only.
-3. **Credential store** (layer 2). AES-GCM with the master key from `secrets.master_key_*`;
-   upload, test-connection, expiry, owner module, audit; the admin screen for it.
-4. **First real module: Schools and Rooms.** Small enough to prove the path — migrations, routes,
+1. **Roles and bindings.** `roles`, `role_grants` (with scope), `role_bindings` (role →
+   capability), seeded so the first administrator actually holds capabilities. Until this lands
+   `/me` returns an empty set and every capability-bearing route refuses — including the
+   auth-settings screens, which is why it comes before the rest of identity.
+2. **Credential store** (layer 2). AES-GCM with the master key from `secrets.master_key_*`;
+   upload, test-connection, expiry, owner module, audit; the admin screen for it. Before SSO,
+   because a client secret entered in the interface has to live somewhere.
+3. **Sign-in with Google.** OpenID Connect for the staff domain, configured through the interface
+   rather than the deployment file; a sign-in route that stores the return URL the app saved and
+   sends the browser back to it. Writes `sso_proven` on the first success, which is what releases
+   the guard on switching local sign-in off.
+4. **The rest of the identity module.** `audit_log` with real and effective actor; account
+   management screens. Impersonation: start, stop, status; lower-privilege targets only,
+   read-only.
+5. **First real module: Schools and Rooms.** Small enough to prove the path — migrations, routes,
    capabilities, navigation, a list page, a detail page, a form — and needed by everything after.
-5. **Roles screen.** Grant roles to people with scope; bind capabilities to roles from the
+6. **Roles screen.** Grant roles to people with scope; bind capabilities to roles from the
    catalogue. Gate behind `roles.bind`. Only after the catalogue has settled.
-6. **Job scheduler.** In-process, DB leader lease, run log, health beat per job, catch-up policy
-   per job. Retention jobs are the first customers.
-7. **Demo mode.** Integrations behind interfaces with fixture implementations, a seed, and a
+7. **Job scheduler.** In-process, DB leader lease, run log, health beat per job, catch-up policy
+   per job. Retention jobs are the first customers — sessions already has the sweep waiting.
+8. **Demo mode.** Integrations behind interfaces with fixture implementations, a seed, and a
    way to view the app as each seeded role. This is also the screenshot-test harness.
-8. **Observability.** Structured logs with request IDs; a health endpoint that proves the
+9. **Observability.** Structured logs with request IDs; a health endpoint that proves the
    credential store as well as the database. (`/healthz` already proves the database: it reads
    `schema_migrations`, because `SELECT 1` stays green against a server the application cannot
    read a row from.)

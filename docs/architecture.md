@@ -67,6 +67,7 @@ internal/config/      layer 1
 internal/database/    the pool and the migration runner
 internal/module/      the Module contract
 internal/session/     server-side sessions: the store, the cookie, the identity resolver
+internal/identity/    accounts, local passwords, auth settings, first-run setup
 internal/webui/       the embedded web app (dist/ is the Vite build output)
 web/                  the TypeScript app (Vite + React)
 deploy/               example config and systemd unit, shipped with each release
@@ -162,6 +163,58 @@ The cookie is `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain`, and c
 this application would then trust. `Lax` rather than `Strict` because Strict drops the cookie on
 the top-level navigation back from the identity provider, landing the user on a signed-out page
 immediately after signing in.
+
+## Signing in
+
+Local passwords exist so a deployment can be reached before SSO is configured, and after SSO
+breaks. They are the bootstrap and the break-glass path, not the everyday one — which makes them
+*more* worth protecting, not less: a break-glass account is the one an attacker most wants and the
+one whose use nobody notices for months.
+
+**Argon2id**, parameters stored with each hash in PHC format so they can be raised later and old
+hashes keep verifying — a scheme whose parameters are compiled in is one nobody ever increases. A
+sign-in with a weaker stored hash re-hashes at the current cost, which is the only moment the
+plaintext exists to do it with.
+
+**Every failure is the same failure.** No such account, wrong password, disabled account: one
+message, one status. An unknown address also burns the same Argon2 computation against a dummy
+hash generated at start, because a form that answers faster for addresses that do not exist is an
+account-enumeration endpoint.
+
+**The throttle counts in the database**, not in memory, so a restart does not reset an attack and
+instances behind a load balancer share one count. Lockout is deliberately slow — an attacker who
+can quickly lock out the break-glass account has taken away the thing that recovers a broken SSO
+configuration.
+
+**Policy is length-first.** Composition rules push people towards `Password1!` and towards writing
+it down; NIST dropped them in 2017. What is left is a real minimum, a byte ceiling so a megabyte
+is never fed to a memory-hard hash, and a check against the few passwords tried first. Every
+problem is reported at once, for the same reason the config loader does it.
+
+### The knob, and the guard on it
+
+Whether local passwords are accepted at all is a setting an administrator changes in the
+interface — layer 3, a row, not the deployment file, because it is a decision the district makes
+and revisits. Per-account credentials are separate: one break-glass account can keep a password
+after everyone else has moved to SSO, which is what you want the day Google is down.
+
+Local sign-in **cannot be switched off until at least one person has actually signed in through
+SSO.** Not "SSO is configured" — configured is an intention. A wrong redirect URI or an
+unpublished consent screen is how a district locks itself out of its own deployment, and the only
+account that could fix it is the one that can no longer get in. `sso_proven` is written by the
+sign-in path, never by a request body, so a caller cannot assert it and unlock the guard in the
+same call that uses it. Turning off every method at once is refused outright.
+
+### First run
+
+A fresh deployment has no accounts, so nobody can sign in to create the first one. The binary
+prints a one-time link at start. Three things bound it: the token is 256 bits and stored only as a
+hash, it expires, and — the control that actually matters — setup refuses once any account exists.
+A token sitting in a log aggregator stops working the moment setup is done, and reissuing on each
+start retires the previous one, so a restarted deployment does not leave a trail of working links.
+
+A rejected attempt does not consume the token: one mistyped password should not burn the only way
+in.
 
 ## Interface principles
 
