@@ -72,10 +72,10 @@ func TestRegistrationRefusesAnUnknownCapability(t *testing.T) {
 func TestDecisions(t *testing.T) {
 	r := testRouter()
 	cases := []struct {
-		name               string
-		method, path       string
-		user, roles        string
-		want               int
+		name         string
+		method, path string
+		user, roles  string
+		want         int
 	}{
 		{"health is public", "GET", "/healthz", "", "", 200},
 		{"no identity is 401", "GET", "/api/v1/notes", "", "", 401},
@@ -100,7 +100,7 @@ func TestMeReturnsWhatTheUIRendersFrom(t *testing.T) {
 		t.Fatalf("me = %d", w.Code)
 	}
 	var body struct {
-		Effective    string      `json:"effective"`
+		Effective    string       `json:"effective"`
 		Capabilities []authz.Held `json:"capabilities"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {

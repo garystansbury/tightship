@@ -23,6 +23,7 @@ type Config struct {
 	Org      Org      `yaml:"org"`
 	Server   Server   `yaml:"server"`
 	Database Database `yaml:"database"`
+	Sessions Sessions `yaml:"sessions"`
 	Domains  Domains  `yaml:"domains"`
 	Mail     Mail     `yaml:"mail"`
 	Secrets  Secrets  `yaml:"secrets"`
@@ -59,11 +60,24 @@ type Database struct {
 	User        string `yaml:"user"`
 	PasswordEnv string `yaml:"password_env"`
 
-	MaxOpenConns    int           `yaml:"max_open_conns"`
-	MaxIdleConns    int           `yaml:"max_idle_conns"`
-	ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime"`
-	ConnMaxIdleTime time.Duration `yaml:"conn_max_idle_time"`
-	ConnectTimeout  time.Duration `yaml:"connect_timeout"`
+	MaxOpenConns    int      `yaml:"max_open_conns"`
+	MaxIdleConns    int      `yaml:"max_idle_conns"`
+	ConnMaxLifetime Duration `yaml:"conn_max_lifetime"`
+	ConnMaxIdleTime Duration `yaml:"conn_max_idle_time"`
+	ConnectTimeout  Duration `yaml:"connect_timeout"`
+}
+
+// Sessions is how long a signed-in session lives. Two limits, because they answer different
+// questions: IdleTimeout is "how long may a session sit unused", which is what protects an
+// unattended browser on a shared cart; AbsoluteLifetime is "how long may a session live at all",
+// which is what bounds a stolen cookie no matter how often it is used.
+//
+// A district on shared devices wants a short idle window; one issuing staff laptops may not.
+// Neither number belongs in code.
+type Sessions struct {
+	IdleTimeout      Duration `yaml:"idle_timeout"`
+	AbsoluteLifetime Duration `yaml:"absolute_lifetime"`
+	CookieName       string   `yaml:"cookie_name"`
 }
 
 // Domains are the account domains identity is reasoned about in.
@@ -136,16 +150,32 @@ func (c *Config) applyDefaults() {
 		// Shorter than MariaDB's default wait_timeout (8h) by a wide margin, so the pool retires
 		// a connection before the server does. A server-side close that the pool has not noticed
 		// surfaces as an "invalid connection" on a request a person is waiting on.
-		c.Database.ConnMaxLifetime = 30 * time.Minute
+		c.Database.ConnMaxLifetime = Duration(30 * time.Minute)
 	}
 	if c.Database.ConnMaxIdleTime == 0 {
-		c.Database.ConnMaxIdleTime = 5 * time.Minute
+		c.Database.ConnMaxIdleTime = Duration(5 * time.Minute)
 	}
 	if c.Database.ConnectTimeout == 0 {
-		c.Database.ConnectTimeout = 10 * time.Second
+		c.Database.ConnectTimeout = Duration(10 * time.Second)
 	}
 	if c.Org.Timezone == "" {
 		c.Org.Timezone = "UTC"
+	}
+	if c.Sessions.IdleTimeout == 0 {
+		// A school day plus a margin: long enough that a teacher is not signed out during a
+		// planning period, short enough that a browser left open on a cart does not stay usable
+		// overnight.
+		c.Sessions.IdleTimeout = Duration(8 * time.Hour)
+	}
+	if c.Sessions.AbsoluteLifetime == 0 {
+		c.Sessions.AbsoluteLifetime = Duration(14 * 24 * time.Hour)
+	}
+	if c.Sessions.CookieName == "" {
+		// The __Host- prefix is enforced by the browser: it refuses the cookie unless it is
+		// Secure, has Path=/ and carries no Domain attribute. That makes it impossible for a
+		// subdomain — including one an attacker controls on the same registrable domain — to set
+		// a session cookie the application would then trust.
+		c.Sessions.CookieName = "__Host-tightship_session"
 	}
 }
 
@@ -182,6 +212,28 @@ func (c *Config) Validate() error {
 	need(c.Domains.Staff, "domains.staff")
 	if c.Secrets.MasterKeyFile == "" && c.Secrets.MasterKeyEnv == "" {
 		problems = append(problems, "secrets.master_key_file or secrets.master_key_env is required")
+	}
+	if c.Sessions.IdleTimeout <= 0 {
+		problems = append(problems, "sessions.idle_timeout must be positive")
+	}
+	if c.Sessions.AbsoluteLifetime <= 0 {
+		problems = append(problems, "sessions.absolute_lifetime must be positive")
+	}
+	if c.Sessions.IdleTimeout > c.Sessions.AbsoluteLifetime {
+		// An idle window longer than the absolute lifetime is not a tighter policy or a looser
+		// one, it is a contradiction: the absolute limit would always fire first and the idle
+		// setting would never do anything. Say so rather than silently ignoring one of them.
+		problems = append(problems, fmt.Sprintf(
+			"sessions.idle_timeout (%s) exceeds sessions.absolute_lifetime (%s), so it can never take effect",
+			c.Sessions.IdleTimeout, c.Sessions.AbsoluteLifetime))
+	}
+	if n := c.Sessions.CookieName; strings.HasPrefix(n, "__Host-") {
+		// Nothing here can violate the prefix's rules — the cookie is always written Secure,
+		// Path=/, no Domain — but a deployment that renames it away from the prefix loses that
+		// browser-enforced guarantee, so only the prefix form is accepted.
+	} else if n != "" {
+		problems = append(problems, "sessions.cookie_name must keep the __Host- prefix: "+
+			"it is what stops a sibling subdomain setting a session cookie this application would trust")
 	}
 	if len(c.Modules) == 0 {
 		problems = append(problems, "modules must enable at least one module")

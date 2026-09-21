@@ -26,6 +26,17 @@ database:
   conn_max_idle_time: 5m                #   a connection before the server closes it underneath us
   connect_timeout: 10s
 
+sessions:
+  # Two limits answering different questions. idle_timeout is how long a session may sit unused —
+  # what protects an unattended browser on a shared cart. absolute_lifetime is how long it may
+  # live at all — what bounds a stolen cookie however often it is used. Use slides the first and
+  # never extends the second.
+  idle_timeout: 8h
+  absolute_lifetime: 14d
+  # The __Host- prefix is browser-enforced: it makes the cookie unsettable by any sibling
+  # subdomain. Keep it.
+  cookie_name: __Host-tightship_session
+
 domains:
   staff: example.org
   students: students.example.org

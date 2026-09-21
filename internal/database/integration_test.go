@@ -26,8 +26,8 @@ func testConfig(t *testing.T) (config.Database, string) {
 	if raw == "" {
 		t.Skip("set TIGHTSHIP_TEST_DSN to run database integration tests")
 	}
-	c := config.Database{Host: "127.0.0.1", Port: 3306, ConnectTimeout: 10 * time.Second,
-		MaxOpenConns: 4, MaxIdleConns: 4, ConnMaxLifetime: time.Minute, ConnMaxIdleTime: time.Minute}
+	c := config.Database{Host: "127.0.0.1", Port: 3306, ConnectTimeout: config.Duration(10 * time.Second),
+		MaxOpenConns: 4, MaxIdleConns: 4, ConnMaxLifetime: config.Duration(time.Minute), ConnMaxIdleTime: config.Duration(time.Minute)}
 	var password string
 	for _, kv := range strings.Fields(raw) {
 		k, v, _ := strings.Cut(kv, "=")
@@ -42,7 +42,28 @@ func testConfig(t *testing.T) (config.Database, string) {
 			c.Name = v
 		}
 	}
+	// `go test ./...` runs packages in parallel, and this package's tests drop every table in
+	// their schema. Sharing one database with another package's integration tests means whichever
+	// starts second finds its tables gone — so the DSN names a base and each package works in its
+	// own database beside it.
+	c.Name = c.Name + "_database"
+	if err := ensureSchema(c, password); err != nil {
+		t.Skipf("cannot prepare %s: %v", c.Name, err)
+	}
 	return c, password
+}
+
+// ensureSchema creates this package's database if it is not there yet.
+func ensureSchema(c config.Database, password string) error {
+	admin := c
+	admin.Name = ""
+	db, err := sql.Open("mysql", dsn(admin, password, false))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec("CREATE DATABASE IF NOT EXISTS `" + c.Name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+	return err
 }
 
 // freshDB hands back a connected pool with no tightship tables in it, so each test starts from a
