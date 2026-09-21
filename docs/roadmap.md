@@ -23,31 +23,43 @@ Done:
 - [x] Local sign-in: accounts, Argon2id passwords, database-backed lockout, the auth-settings knob
       with the "local cannot be disabled until SSO has actually worked" guard, and one-time
       first-run setup
+- [x] Roles, bindings and grants: capabilities bound to roles, roles granted with scope, the
+      administrator role reconciled to the catalogue at every start, and the escalation guard —
+      you cannot give away a capability you do not hold. `/me` now returns real capabilities and
+      the auth-settings screens are reachable.
 
 Next, in order:
-1. **Roles and bindings.** `roles`, `role_grants` (with scope), `role_bindings` (role →
-   capability), seeded so the first administrator actually holds capabilities. Until this lands
-   `/me` returns an empty set and every capability-bearing route refuses — including the
-   auth-settings screens, which is why it comes before the rest of identity.
-2. **Credential store** (layer 2). AES-GCM with the master key from `secrets.master_key_*`;
+1. **Credential store** (layer 2). AES-GCM with the master key from `secrets.master_key_*`;
    upload, test-connection, expiry, owner module, audit; the admin screen for it. Before SSO,
    because a client secret entered in the interface has to live somewhere.
-3. **Sign-in with Google.** OpenID Connect for the staff domain, configured through the interface
-   rather than the deployment file; a sign-in route that stores the return URL the app saved and
-   sends the browser back to it. Writes `sso_proven` on the first success, which is what releases
-   the guard on switching local sign-in off.
-4. **The rest of the identity module.** `audit_log` with real and effective actor; account
+2. **SSO: Google and Microsoft Entra.** Not one provider but a set — both are OpenID Connect, and
+   they differ in discovery URL, claim names and failure modes rather than in protocol. Configured
+   through the interface with a wizard per provider, not in the deployment file. A provider is
+   `proven` the first time it actually carries a sign-in, and that is what releases the guard on
+   switching local sign-in off.
+
+   Three things the design has to get right, all of them Entra-specific:
+   - **The tenant is pinned and the `tid` claim is validated against it.** Pointing Entra at
+     `/common/` lets any Microsoft account in any tenant sign in. It is the most common Entra
+     misconfiguration, it passes testing perfectly, and it is a full authentication bypass.
+   - **Claim mapping is per provider.** Google reliably gives `email` and `email_verified`; Entra
+     often gives only `preferred_username` or `upn`, neither guaranteed to be an email address nor
+     verified. A shared claim map would quietly trust the wrong field.
+   - **Linking pins `sub`, not email.** Matching an OIDC identity to an existing account by email
+     alone means anyone who can make an IdP assert that address becomes that user. The provider's
+     subject is recorded on first link, and the domain must be allow-listed.
+3. **The rest of the identity module.** `audit_log` with real and effective actor; account
    management screens. Impersonation: start, stop, status; lower-privilege targets only,
    read-only.
-5. **First real module: Schools and Rooms.** Small enough to prove the path — migrations, routes,
+4. **First real module: Schools and Rooms.** Small enough to prove the path — migrations, routes,
    capabilities, navigation, a list page, a detail page, a form — and needed by everything after.
-6. **Roles screen.** Grant roles to people with scope; bind capabilities to roles from the
+5. **Roles screen.** Grant roles to people with scope; bind capabilities to roles from the
    catalogue. Gate behind `roles.bind`. Only after the catalogue has settled.
-7. **Job scheduler.** In-process, DB leader lease, run log, health beat per job, catch-up policy
+6. **Job scheduler.** In-process, DB leader lease, run log, health beat per job, catch-up policy
    per job. Retention jobs are the first customers — sessions already has the sweep waiting.
-8. **Demo mode.** Integrations behind interfaces with fixture implementations, a seed, and a
+7. **Demo mode.** Integrations behind interfaces with fixture implementations, a seed, and a
    way to view the app as each seeded role. This is also the screenshot-test harness.
-9. **Observability.** Structured logs with request IDs; a health endpoint that proves the
+8. **Observability.** Structured logs with request IDs; a health endpoint that proves the
    credential store as well as the database. (`/healthz` already proves the database: it reads
    `schema_migrations`, because `SELECT 1` stays green against a server the application cannot
    read a row from.)

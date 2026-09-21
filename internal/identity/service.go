@@ -442,6 +442,11 @@ func (s *Service) CompleteSetup(ctx context.Context, token, email, displayName, 
 	if err := s.SetPassword(ctx, acct.ID, password, false); err != nil {
 		return nil, err
 	}
+	// Without this the setup wizard produces an account that can sign in and do nothing, which
+	// looks exactly like a broken installation.
+	if err := s.GrantAdministrator(ctx, acct.ID, "setup"); err != nil {
+		return nil, err
+	}
 	s.log.Info("first administrator created", "email", acct.Email)
 	return acct, nil
 }

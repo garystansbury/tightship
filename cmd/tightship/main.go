@@ -195,7 +195,11 @@ func runMigrate(args []string, log *slog.Logger) error {
 func buildRouter(c *config.Config, sessions *session.Store, ident *identity.Service, log *slog.Logger) *httpapi.Router {
 	var resolver httpapi.IdentityResolver
 	if sessions != nil {
-		resolver = session.IdentityResolver(sessions, cookies(c), log)
+		var grants session.Grants
+		if ident != nil {
+			grants = ident.GrantsFor
+		}
+		resolver = session.IdentityResolver(sessions, cookies(c), grants, log)
 	}
 	if c.Dev.AllowDebugIdentity {
 		// The debug header wins where it is enabled, so a developer can act as anyone without
@@ -206,7 +210,19 @@ func buildRouter(c *config.Config, sessions *session.Store, ident *identity.Serv
 	}
 	// Bindings come from the database once the identity module lands; until then nobody holds
 	// anything, which is the correct failure direction.
+	// Bindings come from the database now. Without a service — `routes` and `check` build a router
+	// without opening one — nobody holds anything, which is the safe direction.
 	bindings := func(*http.Request) authz.Bindings { return authz.Bindings{} }
+	if ident != nil {
+		bindings = func(req *http.Request) authz.Bindings {
+			b, err := ident.Bindings(req.Context())
+			if err != nil {
+				log.Error("could not read role bindings", "err", err)
+				return authz.Bindings{}
+			}
+			return b
+		}
+	}
 	r := httpapi.New(resolver, bindings, log)
 	for _, m := range modules(c, ident) {
 		m.Routes(r)
@@ -269,6 +285,12 @@ func runServe(args []string, log *slog.Logger) error {
 	// setup link. It is reissued on every start until setup is done, which retires any earlier
 	// one — so a token sitting in a log aggregator stops working as soon as the service restarts,
 	// and stops working permanently the moment the first account exists.
+	// Built-in roles are reconciled before the listener: administrator must hold every capability
+	// this build enforces, including any added by this release, or the screens that need them
+	// appear broken on the morning of an upgrade.
+	if err := ident.EnsureBuiltinRoles(context.Background()); err != nil {
+		return err
+	}
 	if err := announceSetup(context.Background(), ident, c, log); err != nil {
 		return err
 	}

@@ -29,6 +29,13 @@ var (
 	// the power to become them.
 	CapPasswordSetOwn   = authz.Register("password.set_own", "Change your own password")
 	CapPasswordSetOther = authz.Register("password.set_other", "Set another account's local password")
+
+	// Reading, composing and handing out roles are three different powers. Seeing who holds what
+	// is ordinary administrative work; composing a role decides what a capability set means; and
+	// granting decides who gets it. A district that separates duties needs them apart.
+	CapRoleRead  = authz.Register("roles.read", "View roles, their capabilities, and who holds them")
+	CapRoleBind  = authz.Register("roles.bind", "Compose roles by binding capabilities to them")
+	CapRoleGrant = authz.Register("roles.grant", "Grant and revoke roles, with scope")
 )
 
 // Module is the identity module: accounts, the credentials that prove them, and the settings that
@@ -44,6 +51,7 @@ func (Module) Capabilities() []authz.Capability {
 		CapAuthSettingsRead, CapAuthSettingsWrite,
 		CapAccountRead, CapAccountCreate, CapAccountUpdate, CapAccountDisable,
 		CapPasswordSetOwn, CapPasswordSetOther,
+		CapRoleRead, CapRoleBind, CapRoleGrant,
 	}
 }
 
@@ -53,6 +61,7 @@ func (Module) Nav() []module.NavEntry {
 	return []module.NavEntry{
 		{Label: "Accounts", Path: "/admin/accounts", Capability: CapAccountRead, Group: "Admin"},
 		{Label: "Sign-in", Path: "/admin/sign-in", Capability: CapAuthSettingsRead, Group: "Admin"},
+		{Label: "Roles", Path: "/admin/roles", Capability: CapRoleRead, Group: "Admin"},
 	}
 }
 

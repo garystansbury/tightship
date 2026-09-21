@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -58,20 +60,43 @@ func testService(t *testing.T) (context.Context, *Service, *sql.DB) {
 	t.Cleanup(func() { db.Close() })
 
 	ctx := context.Background()
-	for _, tbl := range []string{"local_credentials", "setup_tokens", "settings", "accounts"} {
+	// Children before parents: role_grants references both accounts and roles, so dropping
+	// accounts first fails on the foreign key and leaves the next test running against whatever
+	// the last one left behind.
+	for _, tbl := range []string{
+		"role_grants", "role_bindings", "local_credentials",
+		"setup_tokens", "settings", "roles", "accounts",
+	} {
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS `"+tbl+"`"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ddl, err := migrations.ReadFile("migrations/0001_accounts.sql")
+	// Every migration, in order. The service spans both — setup now grants the administrator
+	// role, so a fixture that applied only the accounts migration would test a service that
+	// cannot exist in a real deployment.
+	names, err := fs.Glob(migrations, "migrations/*.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, string(ddl)); err != nil {
-		t.Fatalf("apply migration: %v", err)
+	sort.Strings(names)
+	for _, n := range names {
+		ddl, err := migrations.ReadFile(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, string(ddl)); err != nil {
+			t.Fatalf("apply %s: %v", n, err)
+		}
 	}
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return ctx, NewService(db, quiet), db
+	svc := NewService(db, quiet)
+	// Mirror how the binary starts: migrations, then built-in roles, then anything else. Setup
+	// grants the administrator role, so a fixture that skipped this would be testing a service in
+	// a state no deployment is ever in.
+	if err := svc.EnsureBuiltinRoles(ctx); err != nil {
+		t.Fatalf("ensure built-in roles: %v", err)
+	}
+	return ctx, svc, db
 }
 
 func TestAuthenticateAcceptsTheRightPassword(t *testing.T) {
