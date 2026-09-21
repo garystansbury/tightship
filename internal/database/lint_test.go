@@ -111,3 +111,72 @@ func TestLintReportsEveryProblem(t *testing.T) {
 		t.Errorf("got %d findings, want 3: %v", len(got), got)
 	}
 }
+
+// A comma inside a column's TYPE must not hide the NOT NULL rule. The first version of this lint
+// scanned the whole statement with a pattern that could not cross a comma, so DECIMAL(10,2) and
+// ENUM('a','b') — the two types most likely to carry money and status — went unreported while
+// VARCHAR(8) was caught. The guarantee the tool advertises silently did not hold for them.
+func TestLintSeesNotNullThroughCommasInTheType(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want bool // want a finding
+	}{
+		{"varchar", "ALTER TABLE t ADD COLUMN s VARCHAR(8) NOT NULL;", true},
+		{"decimal", "ALTER TABLE invoices ADD COLUMN total DECIMAL(10,2) NOT NULL;", true},
+		{"enum", "ALTER TABLE t ADD COLUMN status ENUM('open','closed') NOT NULL;", true},
+		{"decimal with default is fine", "ALTER TABLE t ADD COLUMN total DECIMAL(10,2) NOT NULL DEFAULT 0;", false},
+		{"enum with default is fine", "ALTER TABLE t ADD COLUMN s ENUM('a','b') NOT NULL DEFAULT 'a';", false},
+		{"nullable decimal is fine", "ALTER TABLE t ADD COLUMN total DECIMAL(10,2) NULL;", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := lintOne(tc.sql)
+			if tc.want && len(got) == 0 {
+				t.Errorf("no finding for %q", tc.sql)
+			}
+			if !tc.want && len(got) != 0 {
+				t.Errorf("unexpected finding for %q: %v", tc.sql, got)
+			}
+		})
+	}
+}
+
+// A statement can break more than one guarantee, and reporting one per run means the second is
+// found only after the first is fixed — one CI cycle each.
+func TestLintReportsEveryProblemInOneStatement(t *testing.T) {
+	got := lintOne("ALTER TABLE t DROP COLUMN a, CHANGE b c INT;")
+	if len(got) != 2 {
+		t.Errorf("got %d findings, want 2 (a dropped column and a CHANGE): %v", len(got), got)
+	}
+	var sawDrop, sawChange bool
+	for _, f := range got {
+		if strings.Contains(f.Why, "drops a column") {
+			sawDrop = true
+		}
+		if strings.Contains(f.Why, "CHANGE") {
+			sawChange = true
+		}
+	}
+	if !sawDrop || !sawChange {
+		t.Errorf("findings did not cover both problems: %v", got)
+	}
+}
+
+// Splitting an ALTER's clauses must not split inside parentheses or quotes, or a type list
+// becomes two clauses and the rules read nonsense.
+func TestLintSplitsClausesWithoutBreakingTypesOrStrings(t *testing.T) {
+	// Several additions in one statement, each fine on its own.
+	ok := "ALTER TABLE t ADD COLUMN a DECIMAL(10,2) NULL, ADD COLUMN b ENUM('x','y') NULL, ADD COLUMN c VARCHAR(8) NOT NULL DEFAULT '';"
+	if got := lintOne(ok); len(got) != 0 {
+		t.Errorf("clean multi-clause ALTER produced findings: %v", got)
+	}
+	// One bad clause among good ones is still found, and only it.
+	bad := "ALTER TABLE t ADD COLUMN a DECIMAL(10,2) NULL, ADD COLUMN b VARCHAR(8) NOT NULL, ADD COLUMN c INT NULL;"
+	got := lintOne(bad)
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want exactly 1: %v", len(got), got)
+	}
+	if !strings.Contains(got[0].Statement, "b") {
+		t.Errorf("finding blamed the wrong clause: %q", got[0].Statement)
+	}
+}

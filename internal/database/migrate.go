@@ -182,28 +182,23 @@ func Migrate(ctx context.Context, c config.Database, password string, sources []
 		return 0, err
 	}
 
+	// Check EVERY migration before applying ANY of them.
+	//
+	// These checks used to sit inside the apply loop, which made them fire only when iteration
+	// reached the offending migration. Because modules apply alphabetically, a half-applied
+	// migration in a late-sorting module let an earlier module's DDL run first — and MariaDB
+	// cannot roll that back. The refusal then arrived after the schema had already moved, which is
+	// precisely the "later migrations stacked on a schema nobody can describe" this is here to
+	// prevent. A pre-flight pass is the only ordering where the refusal costs nothing.
+	if err := preflight(migrations, state); err != nil {
+		return 0, err
+	}
+
 	var ran int
 	for _, m := range migrations {
-		prev, seen := state[ledgerKey(m)]
-		switch {
-		case seen && !prev.done:
-			// Refuse rather than retry. Whether the DDL got partway through is not knowable from
-			// here, and guessing wrong corrupts the schema quietly.
-			return ran, fmt.Errorf(
-				"migrations: %s was started but never completed — a previous run died partway. "+
-					"MariaDB cannot roll back DDL, so inspect the schema, finish or undo it by hand, "+
-					"then delete its row from schema_migrations", m.ID())
-		case seen && prev.checksum != m.Checksum:
-			// A released migration is immutable. Editing one means two deployments that both
-			// report the same version have different schemas.
-			return ran, fmt.Errorf(
-				"migrations: %s has changed since it was applied (recorded %s, now %s). "+
-					"A released migration is immutable; add a new one instead",
-				m.ID(), short(prev.checksum), short(m.Checksum))
-		case seen:
+		if _, seen := state[ledgerKey(m)]; seen {
 			continue
 		}
-
 		log.Info("applying migration", "migration", m.ID())
 		if err := apply(ctx, conn, m); err != nil {
 			return ran, err
@@ -211,6 +206,40 @@ func Migrate(ctx context.Context, c config.Database, password string, sources []
 		ran++
 	}
 	return ran, nil
+}
+
+// preflight refuses the whole run if any migration is in a state that makes applying anything
+// unsafe. It reports every problem it finds, so a broken deployment is diagnosed in one pass
+// rather than one failed start per fault.
+func preflight(migrations []Migration, state map[string]applied) error {
+	var problems []string
+	for _, m := range migrations {
+		prev, seen := state[ledgerKey(m)]
+		if !seen {
+			continue
+		}
+		if !prev.done {
+			// Whether the DDL got partway through is not knowable from here, and guessing wrong
+			// corrupts the schema quietly.
+			problems = append(problems, fmt.Sprintf(
+				"%s was started but never completed — a previous run died partway. MariaDB cannot "+
+					"roll back DDL, so inspect the schema, finish or undo it by hand, then delete "+
+					"its row from schema_migrations", m.ID()))
+			continue
+		}
+		if prev.checksum != m.Checksum {
+			// A released migration is immutable: editing one means two deployments reporting the
+			// same version have different schemas.
+			problems = append(problems, fmt.Sprintf(
+				"%s has changed since it was applied (recorded %s, now %s). A released migration "+
+					"is immutable; add a new one instead",
+				m.ID(), short(prev.checksum), short(m.Checksum)))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("migrations: refusing to apply anything:\n  %s", strings.Join(problems, "\n  "))
 }
 
 func ledgerKey(m Migration) string { return m.Module + "/" + strconv.Itoa(m.Version) }

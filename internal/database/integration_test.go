@@ -299,3 +299,58 @@ func TestMigrateCreatesTheLedgerEvenWithNoMigrations(t *testing.T) {
 		t.Fatalf("schema_migrations was not created: %v", err)
 	}
 }
+
+// The exact case that was broken: a later-sorting module half-applied, an earlier-sorting module
+// added in the next release. Nothing must be applied.
+func TestMigrateRefusesEverythingWhenAnyMigrationIsUnsafe(t *testing.T) {
+	ctx, c, pw, db := freshDB(t)
+	broken := []Source{fsMod("core", map[string]string{
+		"0001_ok.sql":     "CREATE TABLE core_one (id INT PRIMARY KEY)",
+		"0002_broken.sql": "CREATE TABLE core_two (id INT PRIMARY KEY); THIS IS NOT SQL",
+	})}
+	if _, err := Migrate(ctx, c, pw, broken, quiet); err == nil {
+		t.Fatal("expected the broken migration to fail")
+	}
+	next := append([]Source{fsMod("assets", map[string]string{
+		"0001_assets.sql": "CREATE TABLE assets_table (id INT PRIMARY KEY)",
+	})}, broken...)
+
+	n, err := Migrate(ctx, c, pw, next, quiet)
+	if err == nil {
+		t.Fatal("a run with a half-applied migration reported success")
+	}
+	if n != 0 {
+		t.Errorf("applied %d migrations despite refusing the run", n)
+	}
+	var found int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=? AND table_name='assets_table'",
+		c.Name).Scan(&found); err != nil {
+		t.Fatal(err)
+	}
+	if found != 0 {
+		t.Error("an earlier-sorting module's DDL was applied before the refusal fired")
+	}
+}
+
+// Preflight reports every fault at once, so a broken deployment is diagnosed in one start.
+func TestPreflightReportsEveryFaultAtOnce(t *testing.T) {
+	migrations := []Migration{
+		{Module: "a", Version: 1, Name: "x", Checksum: "aaa"},
+		{Module: "b", Version: 1, Name: "y", Checksum: "bbb"},
+	}
+	state := map[string]applied{
+		"a/1": {checksum: "aaa", done: false},      // started, never completed
+		"b/1": {checksum: "different", done: true}, // edited since applied
+	}
+	err := preflight(migrations, state)
+	if err == nil {
+		t.Fatal("preflight passed a ledger with two faults")
+	}
+	msg := err.Error()
+	for _, want := range []string{"a/0001_x", "b/0001_y", "started but never completed", "has changed since"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("preflight message omits %q:\n%s", want, msg)
+		}
+	}
+}
