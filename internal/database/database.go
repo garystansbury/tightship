@@ -37,10 +37,10 @@ func Open(ctx context.Context, c config.Database, password string) (*sql.DB, err
 	}
 	db.SetMaxOpenConns(c.MaxOpenConns)
 	db.SetMaxIdleConns(c.MaxIdleConns)
-	db.SetConnMaxLifetime(c.ConnMaxLifetime)
-	db.SetConnMaxIdleTime(c.ConnMaxIdleTime)
+	db.SetConnMaxLifetime(c.ConnMaxLifetime.Std())
+	db.SetConnMaxIdleTime(c.ConnMaxIdleTime.Std())
 
-	pingCtx, cancel := context.WithTimeout(ctx, c.ConnectTimeout)
+	pingCtx, cancel := context.WithTimeout(ctx, c.ConnectTimeout.Std())
 	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
 		db.Close()
@@ -63,7 +63,7 @@ func openForMigrations(ctx context.Context, c config.Database, password string) 
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(0)
 
-	pingCtx, cancel := context.WithTimeout(ctx, c.ConnectTimeout)
+	pingCtx, cancel := context.WithTimeout(ctx, c.ConnectTimeout.Std())
 	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
 		db.Close()
@@ -80,7 +80,7 @@ func dsn(c config.Database, password string, multiStatements bool) string {
 	cfg.Net = "tcp"
 	cfg.Addr = net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 	cfg.DBName = c.Name
-	cfg.Timeout = c.ConnectTimeout
+	cfg.Timeout = c.ConnectTimeout.Std()
 	cfg.MultiStatements = multiStatements
 
 	// ParseTime with Loc=UTC makes the driver hand back time.Time in UTC rather than strings.

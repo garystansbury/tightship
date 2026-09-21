@@ -25,6 +25,7 @@ import (
 	"github.com/garystansbury/tightship/internal/database"
 	"github.com/garystansbury/tightship/internal/httpapi"
 	"github.com/garystansbury/tightship/internal/module"
+	"github.com/garystansbury/tightship/internal/session"
 	"github.com/garystansbury/tightship/internal/webui"
 )
 
@@ -87,8 +88,11 @@ func modules(c *config.Config) []module.Module {
 	return on
 }
 
+// migrationSources is every owner of tables in this build. The session store is not a module —
+// no routes, no capabilities, no navigation — but it owns a table, and database.Source is narrow
+// enough to say exactly that without pretending otherwise.
 func migrationSources(c *config.Config) []database.Source {
-	var out []database.Source
+	out := []database.Source{session.Source{}}
 	for _, m := range modules(c) {
 		out = append(out, m)
 	}
@@ -105,6 +109,10 @@ func dbPassword(c *config.Config) (string, error) {
 			c.Database.PasswordEnv)
 	}
 	return pw, nil
+}
+
+func cookies(c *config.Config) session.Cookies {
+	return session.Cookies{Name: c.Sessions.CookieName}
 }
 
 func runCheck(args []string) error {
@@ -153,9 +161,15 @@ func runMigrate(args []string, log *slog.Logger) error {
 	return nil
 }
 
-func buildRouter(c *config.Config, log *slog.Logger) *httpapi.Router {
+func buildRouter(c *config.Config, sessions *session.Store, log *slog.Logger) *httpapi.Router {
 	var identity httpapi.IdentityResolver
+	if sessions != nil {
+		identity = session.IdentityResolver(sessions, cookies(c), log)
+	}
 	if c.Dev.AllowDebugIdentity {
+		// The debug header wins where it is enabled, so a developer can act as anyone without
+		// signing in. main refuses to enable it unless the deployment file asks for it, and the
+		// deployment file says never in production.
 		log.Warn("dev.allow_debug_identity is ON: requests may name their own identity in a header")
 		identity = httpapi.DebugHeaderIdentity
 	}
@@ -170,7 +184,7 @@ func runRoutes(args []string) error {
 	if err != nil {
 		return err
 	}
-	for _, rt := range buildRouter(c, slog.Default()).Routes() {
+	for _, rt := range buildRouter(c, nil, slog.Default()).Routes() {
 		need := string(rt.Capability)
 		if rt.Public {
 			need = "(public)"
@@ -204,7 +218,7 @@ func runServe(args []string, log *slog.Logger) error {
 		log.Info("migrations applied at start", "count", applied)
 	}
 
-	openCtx, cancelOpen := context.WithTimeout(context.Background(), c.Database.ConnectTimeout)
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), c.Database.ConnectTimeout.Std())
 	db, err := database.Open(openCtx, c.Database, password)
 	cancelOpen()
 	if err != nil {
@@ -212,7 +226,9 @@ func runServe(args []string, log *slog.Logger) error {
 	}
 	defer db.Close()
 
-	api := buildRouter(c, log)
+	sessions := session.New(db, c.Sessions.IdleTimeout.Std(), c.Sessions.AbsoluteLifetime.Std())
+
+	api := buildRouter(c, sessions, log)
 	api.CheckHealth("database", func(ctx context.Context) error { return database.Health(ctx, db) })
 
 	mux := http.NewServeMux()

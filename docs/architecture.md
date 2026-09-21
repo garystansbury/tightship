@@ -66,6 +66,7 @@ internal/httpapi/     the route table, the middleware, /api/v1/me
 internal/config/      layer 1
 internal/database/    the pool and the migration runner
 internal/module/      the Module contract
+internal/session/     server-side sessions: the store, the cookie, the identity resolver
 internal/webui/       the embedded web app (dist/ is the Vite build output)
 web/                  the TypeScript app (Vite + React)
 deploy/               example config and systemd unit, shipped with each release
@@ -121,6 +122,46 @@ adding a `NOT NULL` column with no default are all refused.
 
 Removing a column is still possible, it just takes two releases — stop writing it in release N,
 drop it in N+1, by which point no deployment can roll back to code that reads it.
+
+## Sessions
+
+A signed-in browser holds one cookie containing a random token. Everything else lives in a row, so
+a session can be revoked, listed and expired by the server rather than by asking the browser
+nicely to forget something.
+
+**One cookie for every kind of user.** Staff arriving through Google, students through the IdP and
+contractors on a magic link all get a row in the same table with a different `kind`. D3 says there
+is one interface for every kind of user; this is the part that has to be true before sign-in can
+be written.
+
+**The token is never stored.** The table holds its SHA-256, so a database that leaks — or a backup
+of one — is not a set of live sessions. A plain hash is right here where a password hash would not
+be: the token is 256 bits of CSPRNG output, so there is no guess to slow down, and running bcrypt
+on every request would be a denial-of-service surface.
+
+**Two limits, because they answer different questions.** `idle_timeout` is how long a session may
+sit unused, which is what protects an unattended browser on a shared cart. `absolute_lifetime` is
+how long it may live at all, which is what bounds a stolen cookie no matter how often it is used.
+Continuous use slides the first and never extends the second. Both come from the deployment file,
+because a district on shared devices and one issuing staff laptops want different numbers.
+
+Both are checked in SQL rather than in Go, so a session cannot be resurrected by a clock
+difference between the application and the database — one clock decides. Expiry is exclusive: a
+session is dead *at* `expires_at`, not after it.
+
+**The sliding window is written back at a granularity**, a fortieth of the idle window, not on
+every request. Otherwise every page load, poll and asset fetch carrying the cookie becomes a write,
+and on a fleet this size that would be the busiest write in the system for no benefit.
+
+**Revocation is a row.** `revoked_at` is set, never deleted, so a revoked session stays auditable
+and a returning cookie is recognised as revoked rather than merely unknown. `RevokeAllFor` is
+"sign out everywhere", and it is also what runs the moment an account stops being trusted.
+
+The cookie is `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain`, and carries the
+`__Host-` prefix — which the browser enforces, so no sibling subdomain can set a session cookie
+this application would then trust. `Lax` rather than `Strict` because Strict drops the cookie on
+the top-level navigation back from the identity provider, landing the user on a signed-out page
+immediately after signing in.
 
 ## Interface principles
 
