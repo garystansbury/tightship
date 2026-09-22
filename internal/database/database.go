@@ -99,9 +99,14 @@ func dsn(c config.Database, password string, multiStatements bool) string {
 		// utf8mb4 throughout: a name with an emoji or a non-BMP character must round-trip, not
 		// raise "Incorrect string value" on the row that finally contains one.
 		"charset": "utf8mb4",
-		// Reject silent truncation and zero dates. The production suite this replaces is full of
-		// defects that shipped green; a warning MariaDB would otherwise swallow should be an error.
-		"sql_mode": "'STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'",
+		// Reject silent truncation and zero dates. A warning the server would otherwise swallow
+		// should be an error; the suite this replaces is full of defects that shipped green.
+		//
+		// CONCAT rather than a bare assignment, so this TIGHTENS the server's defaults instead of
+		// replacing them. Assigning outright drops NO_ENGINE_SUBSTITUTION, under which a
+		// CREATE TABLE ... ENGINE=InnoDB silently falls back to another engine with only a warning
+		// if InnoDB is unavailable — precisely the class of failure this setting exists to close.
+		"sql_mode": "CONCAT(@@sql_mode,',STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO')",
 	}
 	return cfg.FormatDSN()
 }

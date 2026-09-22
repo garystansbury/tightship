@@ -227,18 +227,66 @@ func TestLintDoesNotMistakeConstraintsForColumns(t *testing.T) {
 	}
 }
 
-// reChangeCol tells authors to use MODIFY, so MODIFY has to be checked for the one thing that is
-// provably breaking — otherwise the blessed escape hatch is the unchecked one.
-func TestLintChecksModifyForNotNull(t *testing.T) {
-	if got := lintOne("ALTER TABLE rooms MODIFY COLUMN code VARCHAR(8) NOT NULL;"); len(got) == 0 {
-		t.Error("MODIFY ... NOT NULL with no default was not reported")
+// MODIFY is deliberately unchecked, and this pins that rather than leaving it to be re-added by
+// someone reading reChangeCol's advice literally.
+//
+// A previous version did check it, and made widening a NOT NULL column impossible by any spelling:
+// MariaDB's MODIFY must restate the whole definition, so widening VARCHAR(8) to VARCHAR(16)
+// necessarily restates NOT NULL, and the rule flagged it — while CHANGE, the alternative the error
+// message suggests, is refused by a different rule. Blocking ordinary schema work to catch a
+// narrowing the lint cannot reliably identify is the wrong trade while the schema is still being
+// designed. Tightening MODIFY belongs with schema hardening, once the shape has settled.
+func TestLintLeavesModifyAlone(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE rooms MODIFY COLUMN code VARCHAR(16) NOT NULL;", // widening, must restate NOT NULL
+		"ALTER TABLE rooms MODIFY COLUMN label VARCHAR(128) NULL;",   // plain widening
+		"ALTER TABLE rooms MODIFY COLUMN code VARCHAR(8) NOT NULL DEFAULT '';",
+	} {
+		if got := lintOne(sql); len(got) != 0 {
+			t.Errorf("MODIFY was reported, blocking schema work: %q -> %v", sql, got)
+		}
 	}
-	if got := lintOne("ALTER TABLE rooms MODIFY COLUMN code VARCHAR(8) NOT NULL DEFAULT '';"); len(got) != 0 {
-		t.Errorf("MODIFY ... NOT NULL DEFAULT was reported: %v", got)
+}
+
+// String data must not be read as SQL. stripSQLComments leaves literals intact on purpose, so the
+// rules have to be given a masked copy — otherwise a data migration is reported as DDL, and a
+// column whose ENUM happens to contain the word "default" reads as though it had a DEFAULT clause.
+func TestLintDoesNotReadStringDataAsSQL(t *testing.T) {
+	// False positives: keywords inside data.
+	for _, sql := range []string{
+		"UPDATE settings SET v = 'DROP TABLE x';",
+		"INSERT INTO capabilities (name, label) VALUES ('rooms.edit', 'Change a room');",
+		"INSERT INTO capabilities (name, label) VALUES ('t', 'Drop table support');",
+		"INSERT INTO roles (name, description) VALUES ('admin', 'May rename table entries');",
+	} {
+		if got := lintOne(sql); len(got) != 0 {
+			t.Errorf("string data read as SQL: %q -> %v", sql, got)
+		}
 	}
-	// A plain type change is a known gap: widening is safe, narrowing is not, and telling them
-	// apart needs the current column definition. Flagging every one would fail correct builds.
-	if got := lintOne("ALTER TABLE rooms MODIFY COLUMN label VARCHAR(128) NULL;"); len(got) != 0 {
-		t.Errorf("a plain widening was reported: %v", got)
+	// False negatives: a literal containing DEFAULT must not satisfy the default check.
+	for _, sql := range []string{
+		"ALTER TABLE t ADD COLUMN status ENUM('open','default') NOT NULL;",
+		"ALTER TABLE t ADD COLUMN note VARCHAR(50) NOT NULL COMMENT 'no default yet';",
+	} {
+		if got := lintOne(sql); len(got) == 0 {
+			t.Errorf("a literal containing DEFAULT suppressed the rule: %q", sql)
+		}
+	}
+}
+
+// MariaDB's parenthesised ADD forms are valid and were missed entirely, because the capture landed
+// on the word COLUMN rather than the column name.
+func TestLintSeesParenthesisedAddForms(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE rooms ADD COLUMN (code VARCHAR(8) NOT NULL);",
+		"ALTER TABLE rooms ADD (code VARCHAR(8) NOT NULL);",
+	} {
+		if got := lintOne(sql); len(got) == 0 {
+			t.Errorf("no finding for %q", sql)
+		}
+	}
+	// And the parenthesised form with a default is still fine.
+	if got := lintOne("ALTER TABLE rooms ADD COLUMN (code VARCHAR(8) NOT NULL DEFAULT '');"); len(got) != 0 {
+		t.Errorf("false positive: %v", got)
 	}
 }

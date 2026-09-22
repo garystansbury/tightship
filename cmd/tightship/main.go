@@ -76,15 +76,31 @@ func loadConfig(args []string) (*config.Config, error) {
 
 // modules returns the modules this build contains, filtered to those the deployment enabled.
 // Each is both an HTTP surface and a migration source; nothing else in the binary knows the list.
+// allModules is every module compiled into this binary. The parameter exists so a module needing
+// request-path collaborators can be given them; nil is fine where only the static facts — tables,
+// capabilities — are wanted.
+func allModules(_ any) []module.Module {
+	return nil // populated as modules land; see docs/roadmap.md
+}
+
 func modules(c *config.Config) []module.Module {
-	var all []module.Module // populated as modules land; see docs/roadmap.md
 	var on []module.Module
-	for _, m := range all {
+	for _, m := range allModules(nil) {
 		if c.ModuleEnabled(m.Name()) {
 			on = append(on, m)
 		}
 	}
 	return on
+}
+
+// allMigrationSources is every owner of tables compiled into this binary, regardless of config.
+// `check` uses it; `serve` applies only what the deployment enables.
+func allMigrationSources() []database.Source {
+	var out []database.Source
+	for _, m := range allModules(nil) {
+		out = append(out, m)
+	}
+	return out
 }
 
 func migrationSources(c *config.Config) []database.Source {
@@ -112,10 +128,12 @@ func runCheck(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Check the migrations too. `check` is what CI and an operator run before a deployment, and
-	// a migration that breaks rollback is exactly the thing worth catching there rather than at
-	// 3am when the rollback is attempted.
-	migrations, err := database.Collect(migrationSources(c))
+	// Every module this binary contains, not only the ones this config enables. `check` is what
+	// CI runs, against the example file — so linting the enabled subset would leave a module's
+	// migrations completely unvalidated here while it still migrates in a deployment whose config
+	// does enable it. The rollback guarantee would then be only as good as the example file's
+	// module list.
+	migrations, err := database.Collect(allMigrationSources())
 	if err != nil {
 		return err
 	}

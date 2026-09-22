@@ -38,7 +38,15 @@ var (
 	// the most likely hand-written form of a defensive column drop passed silently.
 	reDropColumn = regexp.MustCompile(`(?is)\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?` + "`?" + `\w+` + "`?" + `\s*(?:,|;|$)`)
 	reRename     = regexp.MustCompile(`(?is)\bRENAME\s+(?:TABLE|COLUMN|TO|AS)\b`)
-	reChangeCol  = regexp.MustCompile(`(?is)\bCHANGE\s+(?:COLUMN\s+)?` + "`?" + `\w+`)
+	// CHANGE can rename, so it is refused. MODIFY, which cannot, is deliberately NOT checked at
+	// all: telling a safe widening from a breaking narrowing needs the column's current
+	// definition, which a lint reading migration files does not have. An earlier version did check
+	// it and made widening a NOT NULL column impossible by any spelling — MariaDB's MODIFY must
+	// restate the full definition, so a widening necessarily restates NOT NULL, and the rule
+	// flagged it. Blocking ordinary schema work to catch something it cannot identify reliably is
+	// the wrong trade during active design; tightening MODIFY belongs with schema hardening, once
+	// the shape has settled.
+	reChangeCol = regexp.MustCompile(`(?is)\bCHANGE\s+(?:COLUMN\s+)?` + "`?" + `\w+`)
 	// Matched against a single clause, not a whole statement. An earlier version scanned the
 	// statement with `[^,;]*` around NOT NULL, which cannot cross a comma — so any column whose
 	// TYPE contains one escaped the rule entirely. DECIMAL(10,2) and ENUM('a','b') are the common
@@ -49,14 +57,9 @@ var (
 	// lookahead, so the exclusion is a lookup rather than a pattern — which is clearer anyway.
 	// Without it, ADD CONSTRAINT chk CHECK (b IS NOT NULL) was reported as "adds a NOT NULL column
 	// with no default": a statement that adds no column at all, failing a build that was correct.
-	reNotNullAdd  = regexp.MustCompile(`(?is)\bADD\s+(?:COLUMN\s+)?` + "`?" + `(\w+)`)
+	reNotNullAdd  = regexp.MustCompile(`(?is)\bADD\s+(?:COLUMN\s+)?\(?\s*` + "`?" + `(\w+)`)
 	reHasDefault  = regexp.MustCompile(`(?is)\bDEFAULT\b|\bAUTO_INCREMENT\b`)
 	reNotNullWord = regexp.MustCompile(`(?is)\bNOT\s+NULL\b`)
-
-	// reChangeCol steers authors to MODIFY, so MODIFY has to be checked or the blessed escape
-	// hatch is the unchecked one. Making a column NOT NULL breaks the previous release's INSERTs
-	// exactly as adding one would; narrowing a type breaks its writes.
-	reModifyCol = regexp.MustCompile(`(?is)\bMODIFY\s+(?:COLUMN\s+)?` + "`?" + `\w+`)
 )
 
 // Lint checks a set of migrations and returns every problem, so a migration is fixed in one pass
@@ -73,6 +76,13 @@ func Lint(migrations []Migration) []Finding {
 			// Collapsed, not raw. Testing the raw statement meant a newline or a double space
 			// between ALTER and TABLE set this false, which disabled both isAlter-gated rules AND
 			// the clause split — so reformatting a migration turned the whole lint off for it.
+			// Mask string data before any rule reads it. stripSQLComments deliberately leaves
+			// literals intact — a comment marker inside a quoted string is not a comment — but the
+			// rules must not then read that data as SQL. Without this, a data migration writing
+			// 'DROP TABLE x' is reported as dropping a table, and a column declared
+			// ENUM('open','default') reads as though it had a DEFAULT clause.
+			stmt = maskStringLiterals(stmt)
+			trimmed = collapse(stmt)
 			isAlter := strings.Contains(strings.ToUpper(trimmed), "ALTER TABLE")
 
 			// One ALTER may carry several clauses, and each is a separate decision: ADD this,
@@ -112,17 +122,7 @@ func Lint(migrations []Migration) []Finding {
 					reNotNullWord.MatchString(clause) && !reHasDefault.MatchString(clause) {
 					add("adds a NOT NULL column with no default; the previous release's INSERTs omit it")
 				}
-				// MODIFY cannot rename, so it is safer than CHANGE, but it can still tighten a
-				// column under code that is still writing to it.
-				if isAlter && reModifyCol.MatchString(clause) &&
-					reNotNullWord.MatchString(clause) && !reHasDefault.MatchString(clause) {
-					add("makes a column NOT NULL with no default; the previous release may still write NULL to it")
-				}
-				// A MODIFY that only changes a type is deliberately NOT reported. Widening is safe
-				// and narrowing is not, and telling them apart needs the column's current
-				// definition, which this lint does not have. Flagging every type change would fail
-				// builds for correct migrations, and a lint with false positives is one people
-				// learn to ignore — so this is a known gap, documented rather than guessed at.
+				// MODIFY is deliberately NOT checked. See the note above reChangeCol.
 			}
 		}
 	}
@@ -243,6 +243,47 @@ func splitStatements(s string) []string {
 		out = append(out, cur.String())
 	}
 	return out
+}
+
+// maskStringLiterals replaces the CONTENTS of single- and double-quoted strings with a filler
+// character, keeping the quotes and the length so that positions and clause splitting are
+// unaffected. Backtick-quoted identifiers are left alone: those are column and table names, which
+// the rules are supposed to read.
+func maskStringLiterals(s string) string {
+	b := []byte(s)
+	var inSingle, inDouble bool
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case inSingle:
+			if c == '\\' && i+1 < len(b) {
+				b[i+1] = 'x'
+				i++
+				continue
+			}
+			if c == '\'' {
+				inSingle = false
+				continue
+			}
+			b[i] = 'x'
+		case inDouble:
+			if c == '\\' && i+1 < len(b) {
+				b[i+1] = 'x'
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+				continue
+			}
+			b[i] = 'x'
+		case c == '\'':
+			inSingle = true
+		case c == '"':
+			inDouble = true
+		}
+	}
+	return string(b)
 }
 
 // splitTopLevelCommas cuts an ALTER's clause list on commas that are not inside parentheses or a

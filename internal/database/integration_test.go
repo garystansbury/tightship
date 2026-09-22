@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -428,10 +429,15 @@ func TestMigrationLockIsScopedToTheSchema(t *testing.T) {
 	ctxA, cA, pwA, _ := freshDB(t)
 	cB := cA
 	cB.Name = cA.Name + "_second"
-	if err := ensureSchema(cB, pwA); err != nil {
+	created, err := ensureSchema(cB, pwA)
+	if err != nil {
 		t.Skipf("cannot prepare %s: %v", cB.Name, err)
 	}
-	t.Cleanup(func() { dropSchema(cB, pwA) })
+	if created {
+		// Only drop what this test made. A database of that name may already exist on a shared
+		// development server, and destroying somebody else's is not a thing a test gets to do.
+		t.Cleanup(func() { dropSchema(cB, pwA) })
+	}
 
 	// Hold A's lock for the whole of B's run by starting A's migration and keeping the connection.
 	dbA, err := openForMigrations(ctxA, cA, pwA)
@@ -469,17 +475,29 @@ func TestMigrationLockIsScopedToTheSchema(t *testing.T) {
 }
 
 // ensureSchema creates a database to test against, so a test needing a second one does not depend
-// on somebody having made it by hand.
-func ensureSchema(c config.Database, password string) error {
+// on somebody having made it by hand. It reports whether it actually created it, so the caller
+// knows whether it is entitled to drop it afterwards.
+func ensureSchema(c config.Database, password string) (created bool, err error) {
 	admin := c
 	admin.Name = ""
 	db, err := sql.Open("mysql", dsn(admin, password, false))
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer db.Close()
-	_, err = db.Exec("CREATE DATABASE IF NOT EXISTS `" + c.Name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-	return err
+
+	var existing string
+	err = db.QueryRow("SELECT schema_name FROM information_schema.schemata WHERE schema_name = ?", c.Name).Scan(&existing)
+	if err == nil {
+		return false, nil // already there, and not ours to remove
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	if _, err := db.Exec("CREATE DATABASE `" + c.Name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func dropSchema(c config.Database, password string) {
@@ -491,4 +509,37 @@ func dropSchema(c config.Database, password string) {
 	}
 	defer db.Close()
 	_, _ = db.Exec("DROP DATABASE IF EXISTS `" + c.Name + "`")
+}
+
+// sql_mode must TIGHTEN the server's defaults, not replace them. Assigning outright drops
+// NO_ENGINE_SUBSTITUTION, under which CREATE TABLE ... ENGINE=InnoDB silently falls back to
+// another engine with only a warning if InnoDB is unavailable — the "ships green" failure this
+// setting exists to close, reintroduced by the setting itself.
+func TestSQLModeTightensRatherThanReplacesTheDefaults(t *testing.T) {
+	ctx, _, _, db := freshDB(t)
+
+	var mode string
+	if err := db.QueryRowContext(ctx, "SELECT @@session.sql_mode").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"STRICT_ALL_TABLES", "NO_ZERO_DATE", "NO_ZERO_IN_DATE", "ERROR_FOR_DIVISION_BY_ZERO",
+	} {
+		if !strings.Contains(mode, want) {
+			t.Errorf("session sql_mode is missing %s: %s", want, mode)
+		}
+	}
+
+	var serverMode string
+	if err := db.QueryRowContext(ctx, "SELECT @@global.sql_mode").Scan(&serverMode); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range strings.Split(serverMode, ",") {
+		if m == "" {
+			continue
+		}
+		if !strings.Contains(mode, m) {
+			t.Errorf("the server default %q was dropped rather than kept; session mode is %s", m, mode)
+		}
+	}
 }
