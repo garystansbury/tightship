@@ -172,6 +172,18 @@ func (c *Config) Validate() error {
 	if c.Database.MaxOpenConns < 1 {
 		problems = append(problems, "database.max_open_conns must be at least 1")
 	}
+	// A negative duration is not a smaller timeout, it is a different behaviour: a negative
+	// connect_timeout makes every start fail with a deadline that has already passed, and a
+	// negative conn_max_lifetime means "reuse forever", which disables exactly the stale-connection
+	// protection the setting exists to provide.
+	positive := func(d time.Duration, key string) {
+		if d <= 0 {
+			problems = append(problems, key+" must be positive")
+		}
+	}
+	positive(c.Database.ConnMaxLifetime, "database.conn_max_lifetime")
+	positive(c.Database.ConnMaxIdleTime, "database.conn_max_idle_time")
+	positive(c.Database.ConnectTimeout, "database.connect_timeout")
 	if c.Database.MaxIdleConns > c.Database.MaxOpenConns {
 		// database/sql silently reduces idle to open, which would make the file say one thing
 		// and the pool do another. Say so instead.

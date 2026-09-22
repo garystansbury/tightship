@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -34,13 +35,28 @@ func testConfig(t *testing.T) (config.Database, string) {
 		switch k {
 		case "host":
 			c.Host = v
+		case "port":
+			// The doc comment above advertises port=; dropping it silently sent every run to
+			// 3306 and produced a connection failure that contradicted the documented invocation.
+			if n, err := strconv.Atoi(v); err == nil {
+				c.Port = n
+			} else {
+				t.Fatalf("TIGHTSHIP_TEST_DSN: port=%q is not a number", v)
+			}
 		case "user":
 			c.User = v
 		case "password":
 			password = v
 		case "name":
 			c.Name = v
+		default:
+			t.Fatalf("TIGHTSHIP_TEST_DSN: unknown key %q", k)
 		}
+	}
+	if c.Name == "" || c.User == "" {
+		// Without a schema the connection has no default database and dropAll silently drops
+		// nothing, so the tests run against whatever the previous run left behind.
+		t.Fatal("TIGHTSHIP_TEST_DSN needs at least user= and name=")
 	}
 	return c, password
 }
@@ -343,7 +359,7 @@ func TestPreflightReportsEveryFaultAtOnce(t *testing.T) {
 		"a/1": {checksum: "aaa", done: false},      // started, never completed
 		"b/1": {checksum: "different", done: true}, // edited since applied
 	}
-	err := preflight(migrations, state)
+	err := preflight(migrations, state, []string{"a/0001_x"})
 	if err == nil {
 		t.Fatal("preflight passed a ledger with two faults")
 	}
@@ -353,4 +369,126 @@ func TestPreflightReportsEveryFaultAtOnce(t *testing.T) {
 			t.Errorf("preflight message omits %q:\n%s", want, msg)
 		}
 	}
+}
+
+// Two branches each add a migration; the higher-numbered one merges and deploys first. Applying
+// the lower one afterwards gives this deployment a different schema from a fresh install at the
+// same version — the hazard the checksum rule prevents, reached by another route.
+func TestMigrateRefusesAMigrationNumberedBelowWhatIsApplied(t *testing.T) {
+	ctx, c, pw, _ := freshDB(t)
+	later := []Source{fsMod("core", map[string]string{
+		"0004_later.sql": "CREATE TABLE core_four (id INT PRIMARY KEY)",
+	})}
+	if _, err := Migrate(ctx, c, pw, later, quiet); err != nil {
+		t.Fatal(err)
+	}
+	// The other branch lands, bringing a lower-numbered migration.
+	both := []Source{fsMod("core", map[string]string{
+		"0003_earlier.sql": "CREATE TABLE core_three (id INT PRIMARY KEY)",
+		"0004_later.sql":   "CREATE TABLE core_four (id INT PRIMARY KEY)",
+	})}
+	n, err := Migrate(ctx, c, pw, both, quiet)
+	if err == nil {
+		t.Fatal("applied a migration numbered below one already applied")
+	}
+	if n != 0 {
+		t.Errorf("applied %d migrations while refusing the run", n)
+	}
+	if !strings.Contains(err.Error(), "renumber") {
+		t.Errorf("refusal does not say what to do: %v", err)
+	}
+}
+
+// A half-applied migration whose module is later disabled must still stop the run. The schema is
+// no less half-migrated for the module having gone away.
+func TestMigrateRefusesADirtyRowFromAModuleNoLongerPresent(t *testing.T) {
+	ctx, c, pw, _ := freshDB(t)
+	broken := []Source{fsMod("core", map[string]string{
+		"0001_broken.sql": "CREATE TABLE core_one (id INT PRIMARY KEY); THIS IS NOT SQL",
+	})}
+	if _, err := Migrate(ctx, c, pw, broken, quiet); err == nil {
+		t.Fatal("expected the broken migration to fail")
+	}
+	// The operator disables core to get the binary up, and ships a different module.
+	without := []Source{fsMod("assets", map[string]string{
+		"0001_assets.sql": "CREATE TABLE assets_table (id INT PRIMARY KEY)",
+	})}
+	n, err := Migrate(ctx, c, pw, without, quiet)
+	if err == nil {
+		t.Fatal("a dirty ledger row became invisible once its module was removed from the build")
+	}
+	if n != 0 {
+		t.Errorf("applied %d migrations onto a half-migrated schema", n)
+	}
+}
+
+// GET_LOCK is scoped to the server, so two schemas on one host must not serialise against each
+// other — a staging migration should not be able to fail production's.
+func TestMigrationLockIsScopedToTheSchema(t *testing.T) {
+	ctxA, cA, pwA, _ := freshDB(t)
+	cB := cA
+	cB.Name = cA.Name + "_second"
+	if err := ensureSchema(cB, pwA); err != nil {
+		t.Skipf("cannot prepare %s: %v", cB.Name, err)
+	}
+	t.Cleanup(func() { dropSchema(cB, pwA) })
+
+	// Hold A's lock for the whole of B's run by starting A's migration and keeping the connection.
+	dbA, err := openForMigrations(ctxA, cA, pwA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbA.Close()
+	connA, err := dbA.Conn(ctxA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connA.Close()
+	release, err := lock(ctxA, connA, migrateLockPrefix+cA.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	// B must not wait on it.
+	done := make(chan error, 1)
+	go func() {
+		_, err := Migrate(ctxA, cB, pwA, []Source{fsMod("core", map[string]string{
+			"0001_x.sql": "CREATE TABLE x (id INT PRIMARY KEY)",
+		})}, quiet)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("a second schema's migration failed while another schema held the lock: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Error("a second schema's migration blocked on another schema's lock")
+	}
+}
+
+// ensureSchema creates a database to test against, so a test needing a second one does not depend
+// on somebody having made it by hand.
+func ensureSchema(c config.Database, password string) error {
+	admin := c
+	admin.Name = ""
+	db, err := sql.Open("mysql", dsn(admin, password, false))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec("CREATE DATABASE IF NOT EXISTS `" + c.Name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+	return err
+}
+
+func dropSchema(c config.Database, password string) {
+	admin := c
+	admin.Name = ""
+	db, err := sql.Open("mysql", dsn(admin, password, false))
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	_, _ = db.Exec("DROP DATABASE IF EXISTS `" + c.Name + "`")
 }

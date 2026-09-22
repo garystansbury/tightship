@@ -180,3 +180,65 @@ func TestLintSplitsClausesWithoutBreakingTypesOrStrings(t *testing.T) {
 		t.Errorf("finding blamed the wrong clause: %q", got[0].Statement)
 	}
 }
+
+// isAlter once tested the raw statement for the literal "ALTER TABLE", so a newline or a double
+// space between the two words disabled every rule for that statement AND the clause split. A lint
+// that a reformat switches off is not a guard at all.
+func TestLintIsNotDefeatedByWhitespace(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE rooms DROP COLUMN guid;",
+		"ALTER  TABLE rooms DROP COLUMN guid;",
+		"ALTER\n  TABLE rooms DROP COLUMN guid;",
+		"ALTER\tTABLE rooms DROP COLUMN guid;",
+		"alter table rooms drop column guid;",
+	} {
+		if got := lintOne(sql); len(got) == 0 {
+			t.Errorf("whitespace or case defeated the lint: %q", sql)
+		}
+	}
+}
+
+// IF EXISTS is MariaDB's own spelling, and this lint targets MariaDB, so the most likely
+// hand-written form of a defensive drop must not pass.
+func TestLintSeesDropColumnIfExists(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE rooms DROP COLUMN IF EXISTS guid;",
+		"ALTER TABLE rooms DROP IF EXISTS guid;",
+	} {
+		if got := lintOne(sql); len(got) == 0 {
+			t.Errorf("no finding for %q", sql)
+		}
+	}
+}
+
+// ADD CONSTRAINT and ADD INDEX contain no column, so a NOT NULL inside them must not be read as
+// one. This failed a build for a correct migration, which is how a lint loses its audience.
+func TestLintDoesNotMistakeConstraintsForColumns(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE t ADD CONSTRAINT chk_b CHECK (b IS NOT NULL);",
+		"ALTER TABLE t ADD CHECK (b IS NOT NULL);",
+		"ALTER TABLE t ADD UNIQUE KEY uq_x (a, b);",
+		"ALTER TABLE t ADD INDEX idx_x (a);",
+		"ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES u (id);",
+	} {
+		if got := lintOne(sql); len(got) != 0 {
+			t.Errorf("false positive on %q: %v", sql, got)
+		}
+	}
+}
+
+// reChangeCol tells authors to use MODIFY, so MODIFY has to be checked for the one thing that is
+// provably breaking — otherwise the blessed escape hatch is the unchecked one.
+func TestLintChecksModifyForNotNull(t *testing.T) {
+	if got := lintOne("ALTER TABLE rooms MODIFY COLUMN code VARCHAR(8) NOT NULL;"); len(got) == 0 {
+		t.Error("MODIFY ... NOT NULL with no default was not reported")
+	}
+	if got := lintOne("ALTER TABLE rooms MODIFY COLUMN code VARCHAR(8) NOT NULL DEFAULT '';"); len(got) != 0 {
+		t.Errorf("MODIFY ... NOT NULL DEFAULT was reported: %v", got)
+	}
+	// A plain type change is a known gap: widening is safe, narrowing is not, and telling them
+	// apart needs the current column definition. Flagging every one would fail correct builds.
+	if got := lintOne("ALTER TABLE rooms MODIFY COLUMN label VARCHAR(128) NULL;"); len(got) != 0 {
+		t.Errorf("a plain widening was reported: %v", got)
+	}
+}

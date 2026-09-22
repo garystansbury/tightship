@@ -23,10 +23,14 @@ import (
 // released; the name is for people.
 const migrationsDir = "migrations"
 
-// migrateLockName is the advisory lock every instance takes before migrating. Two binaries
+// migrateLockPrefix names the advisory lock every instance takes before migrating. Two binaries
 // starting at the same moment — a rolling restart, a systemd retry — must not both decide the
 // same migration is pending and both run it.
-const migrateLockName = "tightship:migrate"
+//
+// GET_LOCK names are scoped to the SERVER, not to the schema, so the lock is qualified with the
+// database name. Without that, a staging deployment sharing a server with production waits on
+// production's migration and fails after the timeout, having nothing to do with it.
+const migrateLockPrefix = "tightship:migrate:"
 
 // Migration is one file from one module.
 type Migration struct {
@@ -168,7 +172,7 @@ func Migrate(ctx context.Context, c config.Database, password string, sources []
 	}
 	defer conn.Close()
 
-	release, err := lock(ctx, conn)
+	release, err := lock(ctx, conn, migrateLockPrefix+c.Name)
 	if err != nil {
 		return 0, err
 	}
@@ -181,6 +185,15 @@ func Migrate(ctx context.Context, c config.Database, password string, sources []
 	if err != nil {
 		return 0, err
 	}
+	// Half-written rows are read from the ledger itself rather than by walking the current
+	// migration set, because a migration can vanish from the build: disable the module in config,
+	// or deploy without it, and a row left mid-apply becomes invisible to a check that only looks
+	// at migrations it can still see. The schema is no less half-migrated for the module having
+	// gone away.
+	dirty, err := loadDirty(ctx, conn)
+	if err != nil {
+		return 0, err
+	}
 
 	// Check EVERY migration before applying ANY of them.
 	//
@@ -190,7 +203,7 @@ func Migrate(ctx context.Context, c config.Database, password string, sources []
 	// cannot roll that back. The refusal then arrived after the schema had already moved, which is
 	// precisely the "later migrations stacked on a schema nobody can describe" this is here to
 	// prevent. A pre-flight pass is the only ordering where the refusal costs nothing.
-	if err := preflight(migrations, state); err != nil {
+	if err := preflight(migrations, state, dirty); err != nil {
 		return 0, err
 	}
 
@@ -211,20 +224,54 @@ func Migrate(ctx context.Context, c config.Database, password string, sources []
 // preflight refuses the whole run if any migration is in a state that makes applying anything
 // unsafe. It reports every problem it finds, so a broken deployment is diagnosed in one pass
 // rather than one failed start per fault.
-func preflight(migrations []Migration, state map[string]applied) error {
+func preflight(migrations []Migration, state map[string]applied, dirty []string) error {
 	var problems []string
+
+	// Anything left mid-apply, whether or not this build still contains it.
+	for _, id := range dirty {
+		problems = append(problems, fmt.Sprintf(
+			"%s was started but never completed — a previous run died partway. MariaDB cannot "+
+				"roll back DDL, so inspect the schema, finish or undo it by hand, then delete "+
+				"its row from schema_migrations", id))
+	}
+
+	// The highest version each module has already applied. A pending migration below it would
+	// apply in a different order here than on a fresh install — two deployments reporting the same
+	// version with different schemas, which is the hazard the checksum rule exists to prevent,
+	// reached by another route. It happens when two branches each add a migration and the
+	// higher-numbered one merges first.
+	highest := map[string]int{}
+	for key, a := range state {
+		if !a.done {
+			continue
+		}
+		module, versionText, ok := strings.Cut(key, "/")
+		if !ok {
+			continue
+		}
+		v, err := strconv.Atoi(versionText)
+		if err != nil {
+			continue
+		}
+		if v > highest[module] {
+			highest[module] = v
+		}
+	}
+
 	for _, m := range migrations {
 		prev, seen := state[ledgerKey(m)]
 		if !seen {
+			if h := highest[m.Module]; m.Version < h {
+				problems = append(problems, fmt.Sprintf(
+					"%s has not been applied, but %s is already at version %d. Applying it now "+
+						"would give this deployment a different schema from a fresh install at the "+
+						"same version; renumber it above %d",
+					m.ID(), m.Module, h, h))
+			}
 			continue
 		}
 		if !prev.done {
-			// Whether the DDL got partway through is not knowable from here, and guessing wrong
-			// corrupts the schema quietly.
-			problems = append(problems, fmt.Sprintf(
-				"%s was started but never completed — a previous run died partway. MariaDB cannot "+
-					"roll back DDL, so inspect the schema, finish or undo it by hand, then delete "+
-					"its row from schema_migrations", m.ID()))
+			// Already reported from the ledger sweep above.
 			continue
 		}
 		if prev.checksum != m.Checksum {
@@ -255,11 +302,11 @@ func short(sum string) string {
 // connection is held for the whole migration run and the lock disappears on its own if the
 // process dies — which is the behaviour wanted, since a crashed migrator must not block the next
 // start forever.
-func lock(ctx context.Context, conn *sql.Conn) (func(), error) {
+func lock(ctx context.Context, conn *sql.Conn, name string) (func(), error) {
 	var got sql.NullInt64
 	// 30s: long enough for a rolling restart's second instance to wait out a short migration,
 	// short enough that a stuck one fails the deployment instead of hanging it.
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 30)", migrateLockName).Scan(&got); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 30)", name).Scan(&got); err != nil {
 		return nil, fmt.Errorf("migrations: acquire lock: %w", err)
 	}
 	if !got.Valid || got.Int64 != 1 {
@@ -267,7 +314,7 @@ func lock(ctx context.Context, conn *sql.Conn) (func(), error) {
 	}
 	return func() {
 		// Best effort: the lock is released by the session ending in any case.
-		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "SELECT RELEASE_LOCK(?)", migrateLockName)
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "SELECT RELEASE_LOCK(?)", name)
 	}, nil
 }
 
@@ -288,6 +335,27 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		return fmt.Errorf("migrations: create schema_migrations: %w", err)
 	}
 	return nil
+}
+
+// loadDirty returns the identifiers of every half-written ledger row, independent of what this
+// build contains.
+func loadDirty(ctx context.Context, conn *sql.Conn) ([]string, error) {
+	rows, err := conn.QueryContext(ctx,
+		"SELECT module, version, name FROM schema_migrations WHERE applied_at IS NULL ORDER BY module, version")
+	if err != nil {
+		return nil, fmt.Errorf("migrations: read schema_migrations: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var module, name string
+		var version int
+		if err := rows.Scan(&module, &version, &name); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s/%04d_%s", module, version, name))
+	}
+	return out, rows.Err()
 }
 
 func loadLedger(ctx context.Context, conn *sql.Conn) (map[string]applied, error) {

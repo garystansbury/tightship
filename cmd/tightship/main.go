@@ -227,17 +227,29 @@ func runServe(args []string, log *slog.Logger) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// ListenAndServe returns the moment Shutdown closes the listeners, not when the drain
+	// finishes — so without waiting here, runServe returns, its deferred db.Close() fires, and a
+	// request still inside the grace window fails with "database is closed". A truncated drain is
+	// a nuisance; answering a request wrongly on the way out is not.
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
 		<-ctx.Done()
+		log.Info("draining")
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdown)
+		if err := srv.Shutdown(shutdown); err != nil {
+			log.Warn("drain did not finish cleanly", "err", err)
+		}
 	}()
 	log.Info("tightship serving", "version", version, "listen", c.Server.Listen, "org", c.Org.Name,
 		"modules", c.Modules, "frontend", webui.Built())
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	// Only now is it safe to let the deferred db.Close() run.
+	<-drained
 	log.Info("stopped")
 	return nil
 }
