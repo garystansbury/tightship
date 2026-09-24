@@ -29,7 +29,7 @@ func testConfig(t *testing.T) (config.Database, string) {
 		t.Skip("set TIGHTSHIP_TEST_DSN to run database integration tests")
 	}
 	c := config.Database{Host: "127.0.0.1", Port: 3306, ConnectTimeout: 10 * time.Second,
-		MaxOpenConns: 4, MaxIdleConns: 4, ConnMaxLifetime: time.Minute, ConnMaxIdleTime: time.Minute}
+		MaxOpenConns: 4, ConnMaxLifetime: time.Minute, ConnMaxIdleTime: time.Minute}
 	var password string
 	for _, kv := range strings.Fields(raw) {
 		k, v, _ := strings.Cut(kv, "=")
@@ -93,6 +93,20 @@ func dropAll(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
 		names = append(names, n)
 	}
 	rows.Close()
+
+	// Foreign keys make DROP order-dependent, and information_schema does not return tables in
+	// dependency order. The moment a module ships an ADD FOREIGN KEY — which the lint explicitly
+	// permits — dropping a parent first fails with errno 1451 and every test in the package fails,
+	// in an order that varies by server. Turning the checks off for the teardown makes it
+	// order-independent instead of relying on luck.
+	if _, err := db.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 0"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := db.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 1"); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	for _, n := range names {
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS `"+n+"`"); err != nil {
 			t.Fatalf("drop %s: %v", n, err)

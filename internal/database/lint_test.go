@@ -1,6 +1,7 @@
 package database
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -288,5 +289,100 @@ func TestLintSeesParenthesisedAddForms(t *testing.T) {
 	// And the parenthesised form with a default is still fine.
 	if got := lintOne("ALTER TABLE rooms ADD COLUMN (code VARCHAR(8) NOT NULL DEFAULT '');"); len(got) != 0 {
 		t.Errorf("false positive: %v", got)
+	}
+}
+
+// A column named `key`, `index` or `check` is perfectly ordinary — a settings table almost always
+// has one — and a backtick is the author stating unambiguously that the word is a name, not
+// syntax. Treating a quoted `key` as the KEY keyword let exactly the migration this rule exists to
+// catch pass silently.
+func TestLintReadsBacktickedKeywordsAsColumnNames(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE t ADD COLUMN `key` VARCHAR(64) NOT NULL;",
+		"ALTER TABLE t ADD COLUMN `index` INT NOT NULL;",
+		"ALTER TABLE t ADD COLUMN `check` TINYINT(1) NOT NULL;",
+		"ALTER TABLE t DROP COLUMN `key`;",
+	} {
+		if got := lintOne(sql); len(got) == 0 {
+			t.Errorf("a backtick-quoted column name was read as a keyword: %q", sql)
+		}
+	}
+	// Unquoted, those words really are syntax and must still be excluded.
+	for _, sql := range []string{
+		"ALTER TABLE t ADD CONSTRAINT chk_b CHECK (b IS NOT NULL);",
+		"ALTER TABLE t ADD UNIQUE KEY uq_x (a, b);",
+		"ALTER TABLE t DROP INDEX idx_x;",
+		"ALTER TABLE t DROP PRIMARY KEY;",
+	} {
+		if got := lintOne(sql); len(got) != 0 {
+			t.Errorf("false positive on %q: %v", sql, got)
+		}
+	}
+}
+
+// A table rename is the most rollback-hostile change there is, and MariaDB's shortest spelling
+// omits TO entirely.
+func TestLintSeesRenameWithoutToOrAs(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE rooms RENAME spaces;",
+		"ALTER TABLE rooms RENAME TO spaces;",
+		"ALTER TABLE rooms RENAME AS spaces;",
+		"RENAME TABLE rooms TO spaces;",
+		"ALTER TABLE rooms RENAME COLUMN guid TO room_guid;",
+	} {
+		if got := lintOne(sql); len(got) == 0 {
+			t.Errorf("no finding for %q", sql)
+		}
+	}
+}
+
+// Whether the lint fired used to depend on a comma the author may or may not type: the column name
+// had to be the last token, so any trailing modifier hid the drop.
+func TestLintSeesDropColumnWithTrailingModifiers(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE t DROP COLUMN a;",
+		"ALTER TABLE t DROP COLUMN a ALGORITHM=INPLACE;",
+		"ALTER TABLE t DROP COLUMN a LOCK=NONE;",
+		"ALTER TABLE t DROP COLUMN IF EXISTS a CASCADE;",
+		"ALTER TABLE t DROP COLUMN a, LOCK=NONE;",
+	} {
+		if got := lintOne(sql); len(got) == 0 {
+			t.Errorf("no finding for %q", sql)
+		}
+	}
+}
+
+// A finding carries no line number, so the statement text is the only handle an operator has for
+// locating the clause. Quoting the masked copy gave them 'xxxx', which matches nothing they can
+// grep for.
+func TestLintFindingsQuoteTheOriginalSQL(t *testing.T) {
+	got := lintOne("ALTER TABLE t ADD COLUMN status ENUM('open','closed') NOT NULL;")
+	if len(got) == 0 {
+		t.Fatal("expected a finding")
+	}
+	if strings.Contains(got[0].Statement, "xxx") {
+		t.Errorf("finding quotes masked text: %q", got[0].Statement)
+	}
+	if !strings.Contains(got[0].Statement, "'open'") {
+		t.Errorf("finding does not quote the real SQL: %q", got[0].Statement)
+	}
+}
+
+// Regex over SQL trips on real-world input far more than on invented cases. Every statement in the
+// corpus is a CREATE TABLE, which is always additive, so any finding at all is a false positive.
+// This is the cheapest evidence available that the lint behaves on DDL nobody wrote for it.
+func TestLintProducesNoFalsePositivesOnRealDDL(t *testing.T) {
+	b, err := os.ReadFile("testdata/real_ddl_corpus.sql")
+	if err != nil {
+		t.Fatalf("corpus missing: %v", err)
+	}
+	got := Lint([]Migration{{Module: "corpus", Version: 1, Name: "real_ddl", SQL: string(b)}})
+	if len(got) != 0 {
+		for i, f := range got {
+			if i < 10 {
+				t.Errorf("false positive on real DDL: %s", f)
+			}
+		}
+		t.Fatalf("%d false positive(s) across the real-DDL corpus", len(got))
 	}
 }

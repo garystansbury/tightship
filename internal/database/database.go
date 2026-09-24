@@ -36,7 +36,7 @@ func Open(ctx context.Context, c config.Database, password string) (*sql.DB, err
 		return nil, fmt.Errorf("database: %w", err)
 	}
 	db.SetMaxOpenConns(c.MaxOpenConns)
-	db.SetMaxIdleConns(c.MaxIdleConns)
+	db.SetMaxIdleConns(c.IdleConns())
 	db.SetConnMaxLifetime(c.ConnMaxLifetime)
 	db.SetConnMaxIdleTime(c.ConnMaxIdleTime)
 

@@ -59,11 +59,23 @@ type Database struct {
 	User        string `yaml:"user"`
 	PasswordEnv string `yaml:"password_env"`
 
-	MaxOpenConns    int           `yaml:"max_open_conns"`
-	MaxIdleConns    int           `yaml:"max_idle_conns"`
+	MaxOpenConns int `yaml:"max_open_conns"`
+	// A pointer so that an explicit 0 — "retain no idle connections", a real and reasonable
+	// setting — can be told apart from the key being absent. With a plain int the file could say
+	// zero and the pool would do something else, which is the complaint the max_idle_conns >
+	// max_open_conns check exists to prevent.
+	MaxIdleConns    *int          `yaml:"max_idle_conns"`
 	ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime"`
 	ConnMaxIdleTime time.Duration `yaml:"conn_max_idle_time"`
 	ConnectTimeout  time.Duration `yaml:"connect_timeout"`
+}
+
+// IdleConns is the configured idle-connection limit, with the default already applied.
+func (d Database) IdleConns() int {
+	if d.MaxIdleConns == nil {
+		return d.MaxOpenConns
+	}
+	return *d.MaxIdleConns
 }
 
 // Domains are the account domains identity is reasoned about in.
@@ -127,10 +139,11 @@ func (c *Config) applyDefaults() {
 	if c.Database.MaxOpenConns == 0 {
 		c.Database.MaxOpenConns = 25
 	}
-	if c.Database.MaxIdleConns == 0 {
+	if c.Database.MaxIdleConns == nil {
 		// Matching idle to open keeps a steady workload from reopening connections it just
 		// closed; the lifetime settings below are what stop them going stale.
-		c.Database.MaxIdleConns = c.Database.MaxOpenConns
+		n := c.Database.MaxOpenConns
+		c.Database.MaxIdleConns = &n
 	}
 	if c.Database.ConnMaxLifetime == 0 {
 		// Shorter than MariaDB's default wait_timeout (8h) by a wide margin, so the pool retires
@@ -184,12 +197,13 @@ func (c *Config) Validate() error {
 	positive(c.Database.ConnMaxLifetime, "database.conn_max_lifetime")
 	positive(c.Database.ConnMaxIdleTime, "database.conn_max_idle_time")
 	positive(c.Database.ConnectTimeout, "database.connect_timeout")
-	if c.Database.MaxIdleConns > c.Database.MaxOpenConns {
+	if n := c.Database.IdleConns(); n < 0 {
+		problems = append(problems, "database.max_idle_conns cannot be negative")
+	} else if n > c.Database.MaxOpenConns {
 		// database/sql silently reduces idle to open, which would make the file say one thing
 		// and the pool do another. Say so instead.
 		problems = append(problems, fmt.Sprintf(
-			"database.max_idle_conns (%d) exceeds max_open_conns (%d)",
-			c.Database.MaxIdleConns, c.Database.MaxOpenConns))
+			"database.max_idle_conns (%d) exceeds max_open_conns (%d)", n, c.Database.MaxOpenConns))
 	}
 	need(c.Domains.Staff, "domains.staff")
 	if c.Secrets.MasterKeyFile == "" && c.Secrets.MasterKeyEnv == "" {

@@ -36,8 +36,8 @@ var (
 	reDropTable = regexp.MustCompile(`(?is)\bDROP\s+TABLE\b`)
 	// IF EXISTS is MariaDB's own spelling and this lint targets MariaDB, so leaving it out meant
 	// the most likely hand-written form of a defensive column drop passed silently.
-	reDropColumn = regexp.MustCompile(`(?is)\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?` + "`?" + `\w+` + "`?" + `\s*(?:,|;|$)`)
-	reRename     = regexp.MustCompile(`(?is)\bRENAME\s+(?:TABLE|COLUMN|TO|AS)\b`)
+	reDropColumn = regexp.MustCompile(`(?is)\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(` + "`?" + `)(\w+)`)
+	reRename     = regexp.MustCompile(`(?is)\bRENAME\b`)
 	// CHANGE can rename, so it is refused. MODIFY, which cannot, is deliberately NOT checked at
 	// all: telling a safe widening from a breaking narrowing needs the column's current
 	// definition, which a lint reading migration files does not have. An earlier version did check
@@ -57,7 +57,7 @@ var (
 	// lookahead, so the exclusion is a lookup rather than a pattern — which is clearer anyway.
 	// Without it, ADD CONSTRAINT chk CHECK (b IS NOT NULL) was reported as "adds a NOT NULL column
 	// with no default": a statement that adds no column at all, failing a build that was correct.
-	reNotNullAdd  = regexp.MustCompile(`(?is)\bADD\s+(?:COLUMN\s+)?\(?\s*` + "`?" + `(\w+)`)
+	reNotNullAdd  = regexp.MustCompile(`(?is)\bADD\s+(?:COLUMN\s+)?\(?\s*(` + "`?" + `)(\w+)`)
 	reHasDefault  = regexp.MustCompile(`(?is)\bDEFAULT\b|\bAUTO_INCREMENT\b`)
 	reNotNullWord = regexp.MustCompile(`(?is)\bNOT\s+NULL\b`)
 )
@@ -81,25 +81,35 @@ func Lint(migrations []Migration) []Finding {
 			// rules must not then read that data as SQL. Without this, a data migration writing
 			// 'DROP TABLE x' is reported as dropping a table, and a column declared
 			// ENUM('open','default') reads as though it had a DEFAULT clause.
-			stmt = maskStringLiterals(stmt)
-			trimmed = collapse(stmt)
+			// The rules read a masked copy; the message quotes the original. A finding carries no
+			// line number, so the statement text is the only handle an operator has for locating
+			// the clause — and "ENUM('xxxx','xxxxxx')" matches nothing they can grep for.
+			masked := maskStringLiterals(stmt)
+			trimmed = collapse(masked)
 			isAlter := strings.Contains(strings.ToUpper(trimmed), "ALTER TABLE")
 
 			// One ALTER may carry several clauses, and each is a separate decision: ADD this,
 			// DROP that. Splitting on top-level commas — respecting parentheses and quotes, so a
 			// DECIMAL(10,2) or an ENUM('a','b') stays in one piece — lets each clause be judged on
 			// its own, and lets a statement report every problem it has rather than only the first.
-			clauses := []string{stmt}
+			clauses, originals := []string{masked}, []string{stmt}
 			if isAlter {
-				clauses = splitTopLevelCommas(stmt)
+				clauses = splitTopLevelCommas(masked)
+				// Split the original the same way. Masking preserves length and structure, so the
+				// two lists correspond clause for clause.
+				originals = splitTopLevelCommas(stmt)
 			}
-			for _, clause := range clauses {
+			for i, clause := range clauses {
 				c := collapse(clause)
 				if c == "" {
 					continue
 				}
+				shown := c
+				if i < len(originals) {
+					shown = collapse(originals[i])
+				}
 				add := func(why string) {
-					out = append(out, Finding{Migration: m.ID(), Statement: excerpt(c), Why: why})
+					out = append(out, Finding{Migration: m.ID(), Statement: excerpt(shown), Why: why})
 				}
 				// Not a switch: a clause can break more than one guarantee, and reporting one
 				// problem per run means the next one is found only after the first is fixed.
@@ -112,7 +122,7 @@ func Lint(migrations []Migration) []Finding {
 				if reChangeCol.MatchString(clause) {
 					add("uses CHANGE, which can rename; use MODIFY to alter a type in place")
 				}
-				if isAlter && reDropColumn.MatchString(clause) {
+				if isAlter && dropsAColumn(clause) {
 					add("drops a column; stop writing it in one release and drop it in the next")
 				}
 				// A new NOT NULL column with no default breaks the previous release's INSERTs,
@@ -347,16 +357,36 @@ var notAColumnName = map[string]bool{
 	"constraint": true, "check": true, "index": true, "key": true, "foreign": true,
 	"unique": true, "primary": true, "fulltext": true, "spatial": true, "column": true,
 	"partition": true, "system": true,
+	// Also the words that can follow DROP without a column being dropped.
+	"table": true, "if": true,
 }
 
 // addsAColumn reports whether an ALTER clause adds a column, as opposed to a constraint, an index
 // or a partition — all of which can contain the words NOT NULL without introducing a column.
 func addsAColumn(clause string) bool {
-	m := reNotNullAdd.FindStringSubmatch(clause)
+	return namesAColumn(reNotNullAdd.FindStringSubmatch(clause))
+}
+
+// dropsAColumn is the same question for a DROP clause: DROP TABLE, DROP INDEX and DROP PRIMARY KEY
+// all begin the same way and none of them drops a column.
+func dropsAColumn(clause string) bool {
+	return namesAColumn(reDropColumn.FindStringSubmatch(clause))
+}
+
+// namesAColumn interprets the (quote, identifier) pair both patterns capture.
+//
+// A backtick is the decisive part. `key`, `index` and `check` are perfectly ordinary column names —
+// a settings table almost always has one — and quoting is the author stating unambiguously that
+// the word is an identifier, not syntax. Treating a quoted `key` as the KEY keyword let exactly the
+// migration this rule exists to catch pass silently.
+func namesAColumn(m []string) bool {
 	if m == nil {
 		return false
 	}
-	return !notAColumnName[strings.ToLower(m[1])]
+	if m[1] != "" {
+		return true // backtick-quoted: it is a name, whatever the word is
+	}
+	return !notAColumnName[strings.ToLower(m[2])]
 }
 
 func collapse(s string) string { return strings.Join(strings.Fields(s), " ") }
