@@ -7,12 +7,14 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/garystansbury/tightship/internal/authz"
 )
@@ -47,6 +49,14 @@ type Router struct {
 	identity IdentityResolver
 	bindings BindingsSource
 	log      *slog.Logger
+	health   []HealthCheck
+}
+
+// HealthCheck proves one dependency actually works. A named check appears in the /healthz body so
+// a failing probe says which dependency is down, not merely that something is.
+type HealthCheck struct {
+	Name  string
+	Check func(context.Context) error
 }
 
 // New builds a router. identity and bindings are required; a nil identity resolver would make
@@ -62,11 +72,41 @@ func New(identity IdentityResolver, bindings BindingsSource, log *slog.Logger) *
 		log = slog.Default()
 	}
 	r := &Router{mux: http.NewServeMux(), identity: identity, bindings: bindings, log: log}
-	r.Public(http.MethodGet, "/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	r.Public(http.MethodGet, "/healthz", r.healthz)
 	r.Handle(http.MethodGet, "/api/v1/me", "", nil, r.me)
 	return r
+}
+
+// CheckHealth adds a dependency to /healthz. Without any, the endpoint proves only that the
+// process is listening — which is exactly the health check that stays green while every request
+// fails on a dead database.
+func (r *Router) CheckHealth(name string, check func(context.Context) error) {
+	r.health = append(r.health, HealthCheck{Name: name, Check: check})
+}
+
+// healthz reports each dependency. It answers 503 if any is down, so a load balancer takes the
+// instance out rather than sending it traffic it cannot serve.
+func (r *Router) healthz(w http.ResponseWriter, req *http.Request) {
+	ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+	defer cancel()
+
+	status := http.StatusOK
+	checks := map[string]string{}
+	for _, h := range r.health {
+		if err := h.Check(ctx); err != nil {
+			// The error text can name a host or a user; the log gets it, the response does not.
+			r.log.Error("health check failed", "dependency", h.Name, "err", err)
+			checks[h.Name] = "down"
+			status = http.StatusServiceUnavailable
+			continue
+		}
+		checks[h.Name] = "ok"
+	}
+	body := map[string]any{"status": map[bool]string{true: "ok", false: "degraded"}[status == http.StatusOK]}
+	if len(checks) > 0 {
+		body["checks"] = checks
+	}
+	writeJSON(w, status, body)
 }
 
 // Handle registers a protected route. cap is the capability it requires; a mutating route with

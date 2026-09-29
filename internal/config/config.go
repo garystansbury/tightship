@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -45,14 +46,36 @@ type Server struct {
 	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
-// Database is the MariaDB DSN parts. The password is NOT here: it comes from the credential store
-// or, for bootstrap, the environment variable named by PasswordEnv.
+// Database is the MariaDB DSN parts and the pool shape. The password is NOT here: it comes from
+// the credential store or, for bootstrap, the environment variable named by PasswordEnv.
+//
+// The pool is sized in the deployment file because the right numbers depend on the server, not on
+// the code: MariaDB's max_connections is shared with every other client, and a binary that
+// defaults to a large pool will happily exhaust it during a rolling restart.
 type Database struct {
 	Host        string `yaml:"host"`
 	Port        int    `yaml:"port"`
 	Name        string `yaml:"name"`
 	User        string `yaml:"user"`
 	PasswordEnv string `yaml:"password_env"`
+
+	MaxOpenConns int `yaml:"max_open_conns"`
+	// A pointer so that an explicit 0 — "retain no idle connections", a real and reasonable
+	// setting — can be told apart from the key being absent. With a plain int the file could say
+	// zero and the pool would do something else, which is the complaint the max_idle_conns >
+	// max_open_conns check exists to prevent.
+	MaxIdleConns    *int          `yaml:"max_idle_conns"`
+	ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime"`
+	ConnMaxIdleTime time.Duration `yaml:"conn_max_idle_time"`
+	ConnectTimeout  time.Duration `yaml:"connect_timeout"`
+}
+
+// IdleConns is the configured idle-connection limit, with the default already applied.
+func (d Database) IdleConns() int {
+	if d.MaxIdleConns == nil {
+		return d.MaxOpenConns
+	}
+	return *d.MaxIdleConns
 }
 
 // Domains are the account domains identity is reasoned about in.
@@ -113,6 +136,27 @@ func (c *Config) applyDefaults() {
 	if c.Database.PasswordEnv == "" {
 		c.Database.PasswordEnv = "TIGHTSHIP_DB_PASSWORD"
 	}
+	if c.Database.MaxOpenConns == 0 {
+		c.Database.MaxOpenConns = 25
+	}
+	if c.Database.MaxIdleConns == nil {
+		// Matching idle to open keeps a steady workload from reopening connections it just
+		// closed; the lifetime settings below are what stop them going stale.
+		n := c.Database.MaxOpenConns
+		c.Database.MaxIdleConns = &n
+	}
+	if c.Database.ConnMaxLifetime == 0 {
+		// Shorter than MariaDB's default wait_timeout (8h) by a wide margin, so the pool retires
+		// a connection before the server does. A server-side close that the pool has not noticed
+		// surfaces as an "invalid connection" on a request a person is waiting on.
+		c.Database.ConnMaxLifetime = 30 * time.Minute
+	}
+	if c.Database.ConnMaxIdleTime == 0 {
+		c.Database.ConnMaxIdleTime = 5 * time.Minute
+	}
+	if c.Database.ConnectTimeout == 0 {
+		c.Database.ConnectTimeout = 10 * time.Second
+	}
 	if c.Org.Timezone == "" {
 		c.Org.Timezone = "UTC"
 	}
@@ -135,6 +179,32 @@ func (c *Config) Validate() error {
 	need(c.Database.Host, "database.host")
 	need(c.Database.Name, "database.name")
 	need(c.Database.User, "database.user")
+	if c.Database.Port < 1 || c.Database.Port > 65535 {
+		problems = append(problems, fmt.Sprintf("database.port %d is not a port", c.Database.Port))
+	}
+	if c.Database.MaxOpenConns < 1 {
+		problems = append(problems, "database.max_open_conns must be at least 1")
+	}
+	// A negative duration is not a smaller timeout, it is a different behaviour: a negative
+	// connect_timeout makes every start fail with a deadline that has already passed, and a
+	// negative conn_max_lifetime means "reuse forever", which disables exactly the stale-connection
+	// protection the setting exists to provide.
+	positive := func(d time.Duration, key string) {
+		if d <= 0 {
+			problems = append(problems, key+" must be positive")
+		}
+	}
+	positive(c.Database.ConnMaxLifetime, "database.conn_max_lifetime")
+	positive(c.Database.ConnMaxIdleTime, "database.conn_max_idle_time")
+	positive(c.Database.ConnectTimeout, "database.connect_timeout")
+	if n := c.Database.IdleConns(); n < 0 {
+		problems = append(problems, "database.max_idle_conns cannot be negative")
+	} else if n > c.Database.MaxOpenConns {
+		// database/sql silently reduces idle to open, which would make the file say one thing
+		// and the pool do another. Say so instead.
+		problems = append(problems, fmt.Sprintf(
+			"database.max_idle_conns (%d) exceeds max_open_conns (%d)", n, c.Database.MaxOpenConns))
+	}
 	need(c.Domains.Staff, "domains.staff")
 	if c.Secrets.MasterKeyFile == "" && c.Secrets.MasterKeyEnv == "" {
 		problems = append(problems, "secrets.master_key_file or secrets.master_key_env is required")
