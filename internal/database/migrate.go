@@ -65,6 +65,20 @@ func Collect(sources []Source) ([]Migration, error) {
 	ordered := append([]Source(nil), sources...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name() < ordered[j].Name() })
 
+	// Two sources claiming one name is a wiring mistake, and a quiet one. Their migrations
+	// collapse onto the same ledger key, the sort is not stable so which DDL applies varies
+	// between runs, and the loser surfaces later as a duplicate-key error on schema_migrations
+	// rather than as a named problem. That is two deployments at the same version with different
+	// schemas — precisely what the checksum rule exists to prevent, reached by another route.
+	byName := map[string]bool{}
+	for _, src := range ordered {
+		if byName[src.Name()] {
+			problems = append(problems, fmt.Sprintf("two sources both call themselves %q", src.Name()))
+			continue
+		}
+		byName[src.Name()] = true
+	}
+
 	for _, s := range ordered {
 		fsys := s.Migrations()
 		if fsys == nil {

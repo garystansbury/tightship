@@ -103,3 +103,19 @@ func TestChecksumTracksContent(t *testing.T) {
 		t.Error("different SQL produced the same checksum")
 	}
 }
+
+// Two sources claiming one module name is a wiring mistake that fails quietly: their migrations
+// collapse onto the same ledger key, the sort is not stable so which DDL applies varies between
+// runs, and the loser surfaces as a duplicate-key error rather than a named problem.
+func TestCollectRefusesTwoSourcesWithTheSameName(t *testing.T) {
+	_, err := Collect([]Source{
+		mod("core", map[string]string{"0001_a.sql": "CREATE TABLE from_a (id INT)"}),
+		mod("core", map[string]string{"0001_a.sql": "CREATE TABLE from_b (id INT)"}),
+	})
+	if err == nil {
+		t.Fatal("two sources both named core were accepted")
+	}
+	if !strings.Contains(err.Error(), "core") {
+		t.Errorf("refusal does not name the module: %v", err)
+	}
+}

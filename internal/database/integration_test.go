@@ -99,18 +99,25 @@ func dropAll(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
 	// permits — dropping a parent first fails with errno 1451 and every test in the package fails,
 	// in an order that varies by server. Turning the checks off for the teardown makes it
 	// order-independent instead of relying on luck.
-	if _, err := db.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 0"); err != nil {
+	// On ONE connection. FOREIGN_KEY_CHECKS is a session variable, and the pool holds several
+	// connections — setting it through the pool and then issuing the drops through the pool hands
+	// them to whichever connection is free, which may still have the checks on. The previous
+	// version's comment claimed this made teardown order-independent; it only made it luckier.
+	conn, err := db.Conn(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		if _, err := db.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 1"); err != nil {
-			t.Fatal(err)
-		}
-	}()
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 0"); err != nil {
+		t.Fatal(err)
+	}
 	for _, n := range names {
-		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS `"+n+"`"); err != nil {
+		if _, err := conn.ExecContext(ctx, "DROP TABLE IF EXISTS `"+n+"`"); err != nil {
 			t.Fatalf("drop %s: %v", n, err)
 		}
+	}
+	if _, err := conn.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 1"); err != nil {
+		t.Fatal(err)
 	}
 }
 

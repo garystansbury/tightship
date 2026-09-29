@@ -386,3 +386,82 @@ func TestLintProducesNoFalsePositivesOnRealDDL(t *testing.T) {
 		t.Fatalf("%d false positive(s) across the real-DDL corpus", len(got))
 	}
 }
+
+// Dropping a column's default is routine and entirely rollback-safe. Reporting it as a dropped
+// column failed CI on a correct migration.
+func TestLintAllowsDroppingAColumnDefault(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE t ALTER COLUMN a DROP DEFAULT;",
+		"ALTER TABLE t ALTER a DROP DEFAULT;",
+		"ALTER TABLE t ALTER COLUMN a SET DEFAULT 5;",
+	} {
+		if got := lintOne(sql); len(got) != 0 {
+			t.Errorf("false positive on %q: %v", sql, got)
+		}
+	}
+	// And dropping the column itself is still caught.
+	if got := lintOne("ALTER TABLE t DROP COLUMN a;"); len(got) == 0 {
+		t.Error("a real column drop stopped being reported")
+	}
+}
+
+// MariaDB accepts ALTER ONLINE TABLE and ALTER IGNORE TABLE. Testing for the adjacent substring
+// "ALTER TABLE" set isAlter false for both, switching off every gated rule and the clause split —
+// the same class of defeat as the whitespace bug.
+func TestLintHandlesAlterTableModifiers(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER ONLINE TABLE rooms DROP COLUMN guid;",
+		"ALTER IGNORE TABLE rooms DROP COLUMN guid;",
+		"ALTER ONLINE IGNORE TABLE rooms DROP COLUMN guid;",
+	} {
+		if got := lintOne(sql); len(got) == 0 {
+			t.Errorf("no finding for %q", sql)
+		}
+	}
+}
+
+// An apostrophe inside a backtick-quoted identifier is part of the name, not the start of a
+// string. Without tracking backticks the mask opened a phantom literal and blanked the rest of the
+// statement — and left the masked and unmasked clause lists different lengths, so a finding could
+// quote the wrong clause.
+func TestLintMaskHandlesApostrophesInIdentifiers(t *testing.T) {
+	got := lintOne("ALTER TABLE t ADD COLUMN `o'clock` INT NOT NULL, ADD COLUMN z INT NULL;")
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want 1: %v", len(got), got)
+	}
+	if !strings.Contains(got[0].Statement, "o'clock") {
+		t.Errorf("finding quotes the wrong clause: %q", got[0].Statement)
+	}
+}
+
+// A stripped comment must leave a separator, or DROP/**/TABLE collapses into a word that matches
+// nothing. And MariaDB EXECUTES /*! … */, so its contents are SQL and have to be linted.
+func TestLintHandlesCommentsThatAreNotComments(t *testing.T) {
+	if got := lintOne("DROP/**/TABLE x;"); len(got) == 0 {
+		t.Error("a comment between the keywords hid the drop")
+	}
+	for _, sql := range []string{
+		"/*!40000 DROP TABLE rooms */;",
+		"/*M!100301 ALTER TABLE rooms DROP COLUMN guid */;",
+	} {
+		if got := lintOne(sql); len(got) == 0 {
+			t.Errorf("an executable comment was stripped rather than linted: %q", sql)
+		}
+	}
+	// An ordinary comment is still a comment.
+	if got := lintOne("/* DROP TABLE rooms */ CREATE TABLE t (id INT);"); len(got) != 0 {
+		t.Errorf("an ordinary comment was linted: %v", got)
+	}
+}
+
+// ADD COLUMN(x) with no space is valid. ADD(x) with no space at all is deliberately NOT matched:
+// catching it would mean matching the first three letters of any identifier beginning "add", and
+// an `address` column is far more likely in real schemas than the no-space form.
+func TestLintHandlesAddColumnWithoutASpace(t *testing.T) {
+	if got := lintOne("ALTER TABLE t ADD COLUMN(code VARCHAR(8) NOT NULL);"); len(got) == 0 {
+		t.Error("ADD COLUMN( with no space was missed")
+	}
+	if got := lintOne("ALTER TABLE t ADD COLUMN address VARCHAR(100) NULL;"); len(got) != 0 {
+		t.Errorf("a column named address was misread: %v", got)
+	}
+}

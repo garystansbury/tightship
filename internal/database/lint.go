@@ -57,8 +57,9 @@ var (
 	// lookahead, so the exclusion is a lookup rather than a pattern — which is clearer anyway.
 	// Without it, ADD CONSTRAINT chk CHECK (b IS NOT NULL) was reported as "adds a NOT NULL column
 	// with no default": a statement that adds no column at all, failing a build that was correct.
-	reNotNullAdd  = regexp.MustCompile(`(?is)\bADD\s+(?:COLUMN\s+)?\(?\s*(` + "`?" + `)(\w+)`)
+	reNotNullAdd  = regexp.MustCompile(`(?is)\bADD\s+(?:COLUMN\s*)?\(?\s*(` + "`?" + `)(\w+)`)
 	reHasDefault  = regexp.MustCompile(`(?is)\bDEFAULT\b|\bAUTO_INCREMENT\b`)
+	reAlterTable  = regexp.MustCompile(`(?is)\bALTER\s+(?:ONLINE\s+|IGNORE\s+)*TABLE\b`)
 	reNotNullWord = regexp.MustCompile(`(?is)\bNOT\s+NULL\b`)
 )
 
@@ -86,7 +87,10 @@ func Lint(migrations []Migration) []Finding {
 			// the clause — and "ENUM('xxxx','xxxxxx')" matches nothing they can grep for.
 			masked := maskStringLiterals(stmt)
 			trimmed = collapse(masked)
-			isAlter := strings.Contains(strings.ToUpper(trimmed), "ALTER TABLE")
+			// MariaDB accepts ALTER ONLINE TABLE and ALTER IGNORE TABLE, and testing for the
+			// adjacent substring "ALTER TABLE" set this false for both — switching off the
+			// isAlter-gated rules and the clause split, exactly as the whitespace bug did.
+			isAlter := reAlterTable.MatchString(trimmed)
 
 			// One ALTER may carry several clauses, and each is a separate decision: ADD this,
 			// DROP that. Splitting on top-level commas — respecting parentheses and quotes, so a
@@ -160,6 +164,9 @@ func stripSQLComments(s string) string {
 			if c == '*' && i+1 < len(s) && s[i+1] == '/' {
 				inBlock = false
 				i++
+				// A separator, so DROP/**/TABLE does not collapse into DROPTABLE and match
+				// nothing at all.
+				b.WriteByte(' ')
 			}
 		case inSingle:
 			b.WriteByte(c)
@@ -188,6 +195,13 @@ func stripSQLComments(s string) string {
 		case c == '#':
 			inLine = true
 		case c == '/' && i+1 < len(s) && s[i+1] == '*':
+			// MariaDB EXECUTES /*! … */ and /*M! … */, so their contents are SQL and must be
+			// linted, not stripped. Unwrap them: skip the marker and any version digits, and let
+			// the body through as ordinary text. Only the closing */ is then discarded.
+			if j := executableComment(s, i); j > 0 {
+				i = j - 1
+				continue
+			}
 			inBlock = true
 			i++
 		case c == '\'':
@@ -204,6 +218,24 @@ func stripSQLComments(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// executableComment reports the index just past the opening marker of a MariaDB executable
+// comment starting at i, or 0 if this is an ordinary comment. The forms are /*!…*/, /*!NNNNN…*/
+// and /*M!NNNNN…*/.
+func executableComment(s string, i int) int {
+	j := i + 2 // past "/*"
+	if j < len(s) && (s[j] == 'M' || s[j] == 'm') {
+		j++
+	}
+	if j >= len(s) || s[j] != '!' {
+		return 0
+	}
+	j++
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+	}
+	return j
 }
 
 // splitStatements cuts on semicolons that are not inside a quoted string or identifier. It is not
@@ -261,10 +293,19 @@ func splitStatements(s string) []string {
 // the rules are supposed to read.
 func maskStringLiterals(s string) string {
 	b := []byte(s)
-	var inSingle, inDouble bool
+	var inSingle, inDouble, inBacktick bool
 	for i := 0; i < len(b); i++ {
 		c := b[i]
 		switch {
+		// Backticks are tracked for the same reason every other scanner here tracks them: an
+		// apostrophe inside a quoted identifier is part of the name, not the start of a string.
+		// Without this, a column called `o'clock` opened a phantom literal and blanked the rest of
+		// the statement — and left the masked and unmasked clause lists a different length, so a
+		// finding could quote the wrong clause.
+		case inBacktick:
+			if c == '`' {
+				inBacktick = false
+			}
 		case inSingle:
 			if c == '\\' && i+1 < len(b) {
 				b[i+1] = 'x'
@@ -291,6 +332,8 @@ func maskStringLiterals(s string) string {
 			inSingle = true
 		case c == '"':
 			inDouble = true
+		case c == '`':
+			inBacktick = true
 		}
 	}
 	return string(b)
@@ -357,8 +400,10 @@ var notAColumnName = map[string]bool{
 	"constraint": true, "check": true, "index": true, "key": true, "foreign": true,
 	"unique": true, "primary": true, "fulltext": true, "spatial": true, "column": true,
 	"partition": true, "system": true,
-	// Also the words that can follow DROP without a column being dropped.
-	"table": true, "if": true,
+	// Also the words that can follow DROP without a column being dropped. "default" matters most:
+	// ALTER COLUMN a DROP DEFAULT is routine and entirely rollback-safe, and reporting it failed
+	// CI on a correct migration.
+	"table": true, "if": true, "default": true,
 }
 
 // addsAColumn reports whether an ALTER clause adds a column, as opposed to a constraint, an index
