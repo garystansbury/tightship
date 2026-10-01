@@ -24,7 +24,9 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 //go:embed migrations/*.sql
@@ -82,23 +84,46 @@ type Store struct {
 	// no benefit. A granularity well under the idle window keeps the sliding behaviour honest.
 	touchAfter time.Duration
 
-	now func() time.Time // injectable so expiry can be tested without sleeping
+	// fixed pins the clock, for tests. It is nil in production, and then every timestamp this
+	// store reads or writes is the DATABASE's, not the application's — see dbNow.
+	fixed *time.Time
+}
+
+// dbNow is the expression every time-dependent statement uses for "now". Its parameter is nil in
+// production, so COALESCE falls through to the database server's own clock; a test passes a
+// pinned time instead.
+//
+// One clock has to decide, and it cannot be the application's. With several instances behind a
+// load balancer, a node whose clock lags would keep accepting a session past expires_at, and one
+// whose clock runs ahead would write a last_seen_at in the future and stretch the idle window for
+// every node. The database is the one clock they all share.
+//
+// The CAST is load-bearing. With a parameter supplied, COALESCE's result type is a string, not a
+// DATETIME — so it would not scan as a time, and the comparisons it feeds would be
+// datetime-against-string. Casting makes it the same type whichever branch supplies the value.
+const dbNow = "CAST(COALESCE(?, UTC_TIMESTAMP(3)) AS DATETIME(3))"
+
+// clock is the argument for a dbNow placeholder.
+func (s *Store) clock() any {
+	if s.fixed == nil {
+		return nil
+	}
+	return *s.fixed
 }
 
 // New builds a Store. idle is the sliding window, life the absolute ceiling.
 func New(db *sql.DB, idle, life time.Duration) *Store {
-	return &Store{
-		db:         db,
-		idle:       idle,
-		life:       life,
-		touchAfter: granularity(idle),
-		now:        func() time.Time { return time.Now().UTC() },
-	}
+	return &Store{db: db, idle: idle, life: life, touchAfter: granularity(idle)}
 }
 
 // granularity picks how often the sliding window is actually written back: a fortieth of the idle
 // window, clamped to something sane. At the default 8h idle that is 12 minutes, so a session in
 // continuous use is written about five times a day instead of thousands.
+//
+// It must also stay well under the idle window itself. With a one-minute floor and an idle
+// timeout of a minute or less, a session in constant use was never written back before it idled
+// out — so the window did not slide at all, and the session died one idle period after creation.
+// Capping at half the window guarantees at least one write-back inside it.
 func granularity(idle time.Duration) time.Duration {
 	g := idle / 40
 	if g < time.Minute {
@@ -107,8 +132,17 @@ func granularity(idle time.Duration) time.Duration {
 	if g > 15*time.Minute {
 		g = 15 * time.Minute
 	}
+	if half := idle / 2; g > half {
+		g = half
+	}
 	return g
 }
+
+// Column limits, in characters. utf8mb4 VARCHAR lengths count characters, not bytes.
+const (
+	maxSubject   = 191
+	maxUserAgent = 255
+)
 
 // Create issues a session and returns the token to put in the cookie. The token is returned once
 // and never stored, so it cannot be recovered from the database or from a backup of it.
@@ -116,11 +150,23 @@ func (s *Store) Create(ctx context.Context, subject string, kind Kind, ip net.IP
 	if subject == "" {
 		return "", nil, errors.New("session: subject is required")
 	}
+	// Refused here rather than left to the database. Under strict mode an over-long or malformed
+	// subject is an opaque "Incorrect string value" from the INSERT; this says what is wrong.
+	if !utf8.ValidString(subject) || utf8.RuneCountInString(subject) > maxSubject {
+		return "", nil, fmt.Errorf("session: subject must be valid UTF-8 of at most %d characters", maxSubject)
+	}
 	token, err := newToken()
 	if err != nil {
 		return "", nil, err
 	}
-	now := s.now()
+
+	var now time.Time
+	if err := s.db.QueryRowContext(ctx, "SELECT "+dbNow, s.clock()).Scan(&now); err != nil {
+		return "", nil, fmt.Errorf("session: read clock: %w", err)
+	}
+	// DATETIME(3) keeps milliseconds. Truncating here makes what is returned exactly what is
+	// stored, so a caller comparing against ExpiresAt is comparing against the real boundary.
+	now = now.UTC().Truncate(time.Millisecond)
 	sess := &Session{
 		Subject: subject, Kind: kind,
 		CreatedAt: now, LastSeenAt: now, ExpiresAt: now.Add(s.life),
@@ -129,7 +175,8 @@ func (s *Store) Create(ctx context.Context, subject string, kind Kind, ip net.IP
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO sessions (token_hash, subject, kind, created_at, last_seen_at, expires_at, created_ip, user_agent)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		hashToken(token), subject, string(kind), now, now, sess.ExpiresAt, ipBytes(ip), truncate(userAgent, 255))
+		hashToken(token), subject, string(kind), now, now, sess.ExpiresAt, ipBytes(ip),
+		clean(userAgent, maxUserAgent))
 	if err != nil {
 		return "", nil, fmt.Errorf("session: create: %w", err)
 	}
@@ -142,26 +189,25 @@ func (s *Store) Create(ctx context.Context, subject string, kind Kind, ip net.IP
 // Lookup validates a token and slides the idle window. It returns ErrNotFound for anything that
 // is not a live session.
 //
-// The two limits are checked in SQL rather than in Go so that a session cannot be resurrected by
-// a clock difference between the application and the database: one clock decides.
+// Both limits are decided by the database's clock, in the same statement that finds the row, and
+// the "now" it used comes back with the row so the write-back below uses that same instant.
 func (s *Store) Lookup(ctx context.Context, token string) (*Session, error) {
 	if token == "" {
 		return nil, ErrNotFound
 	}
-	now := s.now()
-	idleCutoff := now.Add(-s.idle)
 
 	var sess Session
 	var kind string
+	var now time.Time
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, subject, kind, created_at, last_seen_at, expires_at
-		FROM sessions
-		WHERE token_hash = ?
-		  AND revoked_at IS NULL
-		  AND expires_at > ?
-		  AND last_seen_at > ?`,
-		hashToken(token), now, idleCutoff,
-	).Scan(&sess.ID, &sess.Subject, &kind, &sess.CreatedAt, &sess.LastSeenAt, &sess.ExpiresAt)
+		SELECT s.id, s.subject, s.kind, s.created_at, s.last_seen_at, s.expires_at, clk.n
+		FROM sessions s, (SELECT `+dbNow+` AS n) clk
+		WHERE s.token_hash = ?
+		  AND s.revoked_at IS NULL
+		  AND s.expires_at > clk.n
+		  AND s.last_seen_at > TIMESTAMPADD(MICROSECOND, ?, clk.n)`,
+		s.clock(), hashToken(token), -s.idle.Microseconds(),
+	).Scan(&sess.ID, &sess.Subject, &kind, &sess.CreatedAt, &sess.LastSeenAt, &sess.ExpiresAt, &now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -186,8 +232,8 @@ func (s *Store) Lookup(ctx context.Context, token string) (*Session, error) {
 // trail and a returning cookie can still be recognised as revoked rather than merely unknown.
 func (s *Store) Revoke(ctx context.Context, token string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL`,
-		s.now(), hashToken(token))
+		`UPDATE sessions SET revoked_at = `+dbNow+` WHERE token_hash = ? AND revoked_at IS NULL`,
+		s.clock(), hashToken(token))
 	if err != nil {
 		return fmt.Errorf("session: revoke: %w", err)
 	}
@@ -199,7 +245,8 @@ func (s *Store) Revoke(ctx context.Context, token string) error {
 // the moment an account stops being trusted, its sessions have to stop too.
 func (s *Store) RevokeAllFor(ctx context.Context, subject string) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE sessions SET revoked_at = ? WHERE subject = ? AND revoked_at IS NULL`, s.now(), subject)
+		`UPDATE sessions SET revoked_at = `+dbNow+` WHERE subject = ? AND revoked_at IS NULL`,
+		s.clock(), subject)
 	if err != nil {
 		return 0, fmt.Errorf("session: revoke all: %w", err)
 	}
@@ -210,13 +257,14 @@ func (s *Store) RevokeAllFor(ctx context.Context, subject string) (int64, error)
 // ListFor returns a subject's live sessions, newest first, so a person can see where they are
 // signed in. The token is not among the fields, because it is not stored.
 func (s *Store) ListFor(ctx context.Context, subject string) ([]Session, error) {
-	now := s.now()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, subject, kind, created_at, last_seen_at, expires_at
-		FROM sessions
-		WHERE subject = ? AND revoked_at IS NULL AND expires_at > ? AND last_seen_at > ?
-		ORDER BY last_seen_at DESC`,
-		subject, now, now.Add(-s.idle))
+		SELECT s.id, s.subject, s.kind, s.created_at, s.last_seen_at, s.expires_at
+		FROM sessions s, (SELECT `+dbNow+` AS n) clk
+		WHERE s.subject = ? AND s.revoked_at IS NULL
+		  AND s.expires_at > clk.n
+		  AND s.last_seen_at > TIMESTAMPADD(MICROSECOND, ?, clk.n)
+		ORDER BY s.last_seen_at DESC`,
+		s.clock(), subject, -s.idle.Microseconds())
 	if err != nil {
 		return nil, fmt.Errorf("session: list: %w", err)
 	}
@@ -244,12 +292,13 @@ func (s *Store) DeleteExpired(ctx context.Context, retain time.Duration, batch i
 	if batch <= 0 {
 		batch = 1000
 	}
-	cutoff := s.now().Add(-retain)
+	cutoff := "TIMESTAMPADD(MICROSECOND, ?, " + dbNow + ")"
 	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM sessions
-		WHERE expires_at < ?
-		   OR (revoked_at IS NOT NULL AND revoked_at < ?)
-		LIMIT ?`, cutoff, cutoff, batch)
+		WHERE expires_at < `+cutoff+`
+		   OR (revoked_at IS NOT NULL AND revoked_at < `+cutoff+`)
+		LIMIT ?`,
+		-retain.Microseconds(), s.clock(), -retain.Microseconds(), s.clock(), batch)
 	if err != nil {
 		return 0, fmt.Errorf("session: delete expired: %w", err)
 	}
@@ -282,9 +331,24 @@ func ipBytes(ip net.IP) []byte {
 	return ip.To16()
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
+// clean makes a client-supplied string safe to store in a utf8mb4 column of n characters.
+//
+// The User-Agent header is whatever the client sends. Cutting it to n BYTES could split a
+// multi-byte character and leave invalid UTF-8, and a header that was invalid UTF-8 to begin with
+// is the same problem without the cut — either way, strict mode rejects the INSERT and that
+// browser can never sign in. So invalid sequences are replaced first, and the cut is made on a
+// character boundary, at n characters, which is what the column actually counts.
+func clean(s string, n int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n]
+	i, count := 0, 0
+	for i = range s {
+		if count == n {
+			break
+		}
+		count++
+	}
+	return s[:i]
 }

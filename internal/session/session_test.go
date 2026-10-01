@@ -41,19 +41,25 @@ func TestHashTokenIsStableAndDistinct(t *testing.T) {
 }
 
 // The sliding window is written back at a granularity, not on every request, or every page load
-// becomes a write. It still has to be far finer than the idle window, or the window stops being
-// meaningfully sliding.
-func TestTouchGranularityIsFarBelowTheIdleWindow(t *testing.T) {
-	for _, idle := range []time.Duration{time.Minute, time.Hour, 8 * time.Hour, 72 * time.Hour} {
+// becomes a write. But it must stay well inside the idle window, or the window does not slide: with
+// a one-minute floor and an idle timeout of a minute or less, a session in constant use was never
+// written back before it idled out, and died one idle period after it was created.
+func TestTouchGranularitySlidesForEveryIdleTimeout(t *testing.T) {
+	for _, idle := range []time.Duration{
+		10 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute,
+		time.Hour, 8 * time.Hour, 72 * time.Hour,
+	} {
 		g := granularity(idle)
-		if g < time.Minute {
-			t.Errorf("idle %s: granularity %s is under a minute; that is a write per request", idle, g)
+		if g > idle/2 {
+			t.Errorf("idle %s: granularity %s leaves no guaranteed write-back inside the window", idle, g)
 		}
 		if g > 15*time.Minute {
 			t.Errorf("idle %s: granularity %s is too coarse", idle, g)
 		}
-		if idle > 10*time.Minute && g > idle/10 {
-			t.Errorf("idle %s: granularity %s is too close to the window to slide honestly", idle, g)
+		// For any idle window long enough to afford it, the floor still keeps this from becoming
+		// a write per request.
+		if idle >= 2*time.Minute && g < time.Minute {
+			t.Errorf("idle %s: granularity %s is a write per request", idle, g)
 		}
 	}
 }

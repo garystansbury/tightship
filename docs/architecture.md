@@ -149,13 +149,18 @@ how long it may live at all, which is what bounds a stolen cookie no matter how 
 Continuous use slides the first and never extends the second. Both come from the deployment file,
 because a district on shared devices and one issuing staff laptops want different numbers.
 
-Both are checked in SQL rather than in Go, so a session cannot be resurrected by a clock
-difference between the application and the database — one clock decides. Expiry is exclusive: a
-session is dead *at* `expires_at`, not after it.
+Both are decided by **the database's clock, not the application's**. Every timestamp the store
+reads or writes is `UTC_TIMESTAMP(3)` on the server; no app instance's own time enters a decision.
+With several instances behind a load balancer, a node whose clock lags would otherwise keep
+accepting a session past its expiry, and one whose clock runs ahead would write a `last_seen_at` in
+the future and stretch the idle window for every node. Expiry is exclusive: a session is dead *at*
+`expires_at`, not after it.
 
 **The sliding window is written back at a granularity**, a fortieth of the idle window, not on
 every request. Otherwise every page load, poll and asset fetch carrying the cookie becomes a write,
-and on a fleet this size that would be the busiest write in the system for no benefit.
+and on a fleet this size that would be the busiest write in the system for no benefit. The
+granularity is also capped at half the window, so that even a very short idle timeout gets a
+guaranteed write-back inside it and still slides.
 
 **Revocation is a row.** `revoked_at` is set, never deleted, so a revoked session stays auditable
 and a returning cookie is recognised as revoked rather than merely unknown. `RevokeAllFor` is

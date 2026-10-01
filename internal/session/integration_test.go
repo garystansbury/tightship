@@ -5,54 +5,77 @@ import (
 	"database/sql"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/garystansbury/tightship/internal/config"
+	"github.com/garystansbury/tightship/internal/database"
 )
 
-// These need a real database: expiry is decided in SQL so that one clock rules, revocation is a
-// row, and "the token is not stored" is a claim about what is actually on disk. Skipped unless
+// These need a real database: expiry is decided by the database's clock, revocation is a row, and
+// "the token is not stored" is a claim about what is actually on disk. Skipped unless
 // TIGHTSHIP_TEST_DSN is set.
+//
+// The pool comes from database.Open, not a hand-built DSN, so these tests run under exactly the
+// connection settings production uses — strict sql_mode, utf8mb4, the UTC session zone. An earlier
+// version built its own DSN, and drifted: it ignored port= and omitted the strict mode under which
+// an over-long User-Agent fails to insert.
 func testStore(t *testing.T, idle, life time.Duration) (context.Context, *Store, *sql.DB) {
 	t.Helper()
 	raw := os.Getenv("TIGHTSHIP_TEST_DSN")
 	if raw == "" {
 		t.Skip("set TIGHTSHIP_TEST_DSN to run session integration tests")
 	}
-	var host, user, password, name string
-	host = "127.0.0.1"
+	c := config.Database{Host: "127.0.0.1", Port: 3306, MaxOpenConns: 4,
+		ConnectTimeout:  config.Duration(10 * time.Second),
+		ConnMaxLifetime: config.Duration(time.Minute),
+		ConnMaxIdleTime: config.Duration(time.Minute)}
+	var password string
 	for _, kv := range strings.Fields(raw) {
 		k, v, _ := strings.Cut(kv, "=")
 		switch k {
 		case "host":
-			host = v
+			c.Host = v
+		case "port":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				t.Fatalf("TIGHTSHIP_TEST_DSN: port=%q is not a number", v)
+			}
+			c.Port = n
 		case "user":
-			user = v
+			c.User = v
 		case "password":
 			password = v
 		case "name":
-			name = v
+			c.Name = v
+		default:
+			t.Fatalf("TIGHTSHIP_TEST_DSN: unknown key %q", k)
 		}
 	}
+	if c.Name == "" || c.User == "" {
+		t.Fatal("TIGHTSHIP_TEST_DSN needs at least user= and name=")
+	}
 	// Own database, not shared: `go test ./...` runs packages in parallel and the database
-	// package's tests drop every table in their schema. See internal/database/integration_test.go.
-	name += "_session"
-	base := user + ":" + password + "@tcp(" + host + ":3306)/"
-	opts := "?parseTime=true&loc=UTC&time_zone=%27%2B00%3A00%27"
+	// package's tests drop every table in their schema.
+	base := c.Name
+	c.Name = base + "_session"
 
-	admin, err := sql.Open("mysql", base+opts)
+	admin := c
+	admin.Name = base
+	adb, err := database.Open(context.Background(), admin, password)
 	if err != nil {
-		t.Fatal(err)
+		t.Skipf("cannot reach the test database: %v", err)
 	}
-	if _, err := admin.Exec("CREATE DATABASE IF NOT EXISTS `" + name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
-		admin.Close()
-		t.Skipf("cannot prepare %s: %v", name, err)
+	if _, err := adb.Exec("CREATE DATABASE IF NOT EXISTS `" + c.Name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
+		adb.Close()
+		t.Skipf("cannot prepare %s: %v", c.Name, err)
 	}
-	admin.Close()
+	adb.Close()
 
-	db, err := sql.Open("mysql", base+name+opts)
+	db, err := database.Open(context.Background(), c, password)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +101,9 @@ func readMigration() (string, error) {
 }
 
 // at pins the store's clock so expiry can be tested without sleeping through it.
-func at(s *Store, when time.Time) { s.now = func() time.Time { return when } }
+// at pins the store's clock so expiry can be tested without sleeping. Production never sets it,
+// and then every timestamp is the database's own.
+func at(s *Store, when time.Time) { w := when.UTC(); s.fixed = &w }
 
 func TestCreateAndLookupRoundTrip(t *testing.T) {
 	ctx, store, _ := testStore(t, time.Hour, 24*time.Hour)
@@ -394,5 +419,97 @@ func TestConcurrentCreatesDoNotCollide(t *testing.T) {
 	}
 	if distinct != total || total != 20 {
 		t.Errorf("distinct=%d total=%d, want 20 and 20", distinct, total)
+	}
+}
+
+// The User-Agent header is whatever the client sends. Cutting it by bytes could split a multi-byte
+// character, and an already-invalid header is the same problem without the cut — either way strict
+// mode rejected the INSERT and that browser could never sign in.
+func TestAnyUserAgentCanSignIn(t *testing.T) {
+	ctx, store, db := testStore(t, time.Hour, 24*time.Hour)
+	for name, ua := range map[string]string{
+		"multi-byte character across the limit": strings.Repeat("a", 254) + "é" + "tail",
+		"four-byte characters past the limit":   strings.Repeat("𝓊", 300),
+		"invalid UTF-8 from the client":         "Mozilla/5.0 \xff\xfe broken",
+		"empty":                                 "",
+	} {
+		token, _, err := store.Create(ctx, "teacher@example.org", KindStaff, nil, ua)
+		if err != nil {
+			t.Errorf("%s: sign-in failed: %v", name, err)
+			continue
+		}
+		var stored string
+		if err := db.QueryRowContext(ctx,
+			"SELECT user_agent FROM sessions WHERE token_hash = ?", hashToken(token)).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if !utf8.ValidString(stored) || utf8.RuneCountInString(stored) > maxUserAgent {
+			t.Errorf("%s: stored %d characters, valid=%v", name, utf8.RuneCountInString(stored), utf8.ValidString(stored))
+		}
+	}
+}
+
+// An over-long subject is refused with a message that says so, not left to surface as an opaque
+// "Incorrect string value" from the database.
+func TestOverlongSubjectIsRefusedClearly(t *testing.T) {
+	ctx, store, _ := testStore(t, time.Hour, 24*time.Hour)
+	_, _, err := store.Create(ctx, strings.Repeat("a", 200)+"@example.org", KindStaff, nil, "")
+	if err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Errorf("err = %v, want a clear refusal", err)
+	}
+}
+
+// One clock decides, and it is the database's. MariaDB's SET timestamp fakes the server clock for
+// a single session, so this moves the database to 2030 while Go's clock stays at today. If any
+// application timestamp leaked into a decision, these assertions would see today's date.
+func TestTheDatabaseClockDecides(t *testing.T) {
+	ctx, store, db := testStore(t, time.Hour, 24*time.Hour)
+	// One connection, so the faked clock applies to every statement the store issues.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	future := time.Date(2030, 6, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := db.ExecContext(ctx, "SET timestamp = ?", future.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "SET timestamp = DEFAULT") })
+
+	token, sess, err := store.Create(ctx, "teacher@example.org", KindStaff, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.CreatedAt.Year() != 2030 {
+		t.Fatalf("created_at = %v: the session was stamped with the application's clock", sess.CreatedAt)
+	}
+
+	// Still alive by the database's clock.
+	if _, err := store.Lookup(ctx, token); err != nil {
+		t.Fatalf("lookup at the faked time failed: %v", err)
+	}
+
+	// Move only the DATABASE past the absolute lifetime. Go's clock still says the session is
+	// years from expiring; the database must win.
+	if _, err := db.ExecContext(ctx, "SET timestamp = ?", future.Add(25*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Lookup(ctx, token); err != ErrNotFound {
+		t.Errorf("err = %v, want ErrNotFound: expiry was decided by a clock other than the database's", err)
+	}
+}
+
+// With a one-minute idle window, a session used every forty seconds must stay alive indefinitely.
+// It used to die after a minute regardless, because the write-back floor equalled the window.
+func TestShortIdleWindowStillSlides(t *testing.T) {
+	ctx, store, _ := testStore(t, time.Minute, 24*time.Hour)
+	start := time.Now().UTC().Add(-48 * time.Hour)
+	at(store, start)
+	token, _, err := store.Create(ctx, "teacher@example.org", KindStaff, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 10; i++ { // six and a half minutes of use, against a one-minute window
+		at(store, start.Add(time.Duration(i)*40*time.Second))
+		if _, err := store.Lookup(ctx, token); err != nil {
+			t.Fatalf("session idled out at step %d despite use every 40s: %v", i, err)
+		}
 	}
 }
